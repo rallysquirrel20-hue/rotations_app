@@ -9,6 +9,7 @@ interface RangeTrigger {
 
 interface TVChartProps {
   data: any[];
+  liveUpdate?: any;
   showPivots: boolean;
   showTargets: boolean;
   showVolume: boolean;
@@ -17,11 +18,24 @@ interface TVChartProps {
   symbolName?: string;
 }
 
+const parseTime = (dateStr: string) => {
+  if (typeof dateStr === 'string' && dateStr.includes('T')) {
+    // NOMINAL TIME FIX:
+    // We treat the incoming "YYYY-MM-DDTHH:mm:ss" string as if it were UTC.
+    // This prevents the browser from shifting the New York hours based on the user's local timezone.
+    const d = new Date(dateStr.endsWith('Z') ? dateStr : dateStr + 'Z');
+    return Math.floor(d.getTime() / 1000) as any;
+  }
+  return dateStr;
+};
+
 export const TVChart: React.FC<TVChartProps> = ({ 
-  data, showPivots, showTargets, showVolume, rangeUpdateTrigger, exportTrigger, symbolName 
+  data, liveUpdate, showPivots, showTargets, showVolume, rangeUpdateTrigger, exportTrigger, symbolName 
 }) => {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
+  const candlestickSeriesRef = useRef<any>(null);
+  const volumeSeriesRef = useRef<any>(null);
   const ohlcDataRef = useRef<any[]>([]);
   const lastExportTriggerRef = useRef<number>(exportTrigger || 0);
 
@@ -33,8 +47,8 @@ export const TVChart: React.FC<TVChartProps> = ({
       if (trigger?.reset1Y || !trigger) {
         timeScale.setVisibleLogicalRange({ from: lastIndex - 252, to: lastIndex + 20 });
       } else if (trigger.from || trigger.to) {
-        const from = trigger.from || ohlcData[0].time;
-        const to = trigger.to || ohlcData[lastIndex].time;
+        const from = trigger.from ? parseTime(trigger.from) : ohlcData[0].time;
+        const to = trigger.to ? parseTime(trigger.to) : ohlcData[lastIndex].time;
         timeScale.setVisibleRange({ from: from as any, to: to as any });
       }
     } catch (e) { console.error("Error setting range:", e); }
@@ -60,6 +74,26 @@ export const TVChart: React.FC<TVChartProps> = ({
   }, [rangeUpdateTrigger]);
 
   useEffect(() => {
+    if (liveUpdate && candlestickSeriesRef.current) {
+      const parsedTime = parseTime(liveUpdate.time);
+      const parsedUpdate = { ...liveUpdate, time: parsedTime };
+
+      try {
+        candlestickSeriesRef.current.update(parsedUpdate);
+        if (showVolume && volumeSeriesRef.current && liveUpdate.volume !== undefined) {
+          volumeSeriesRef.current.update({
+            time: parsedTime,
+            value: liveUpdate.volume,
+            color: 'rgba(0, 0, 0, 0.1)',
+          });
+        }
+      } catch (e) {
+        console.error("Error updating live data:", e);
+      }
+    }
+  }, [liveUpdate, showVolume]);
+
+  useEffect(() => {
     if (!chartContainerRef.current || data.length === 0) return;
 
     const uniqueDataMap = new Map();
@@ -69,7 +103,7 @@ export const TVChart: React.FC<TVChartProps> = ({
     const ohlcData = sortedData
       .filter(d => d.Open != null && d.High != null && d.Low != null && d.Close != null)
       .map((d) => ({
-        time: d.Date,
+        time: parseTime(d.Date),
         open: Number(d.Open),
         high: Number(d.High),
         low: Number(d.Low),
@@ -78,6 +112,10 @@ export const TVChart: React.FC<TVChartProps> = ({
       .filter(d => !isNaN(d.open) && !isNaN(d.high) && !isNaN(d.low) && !isNaN(d.close));
 
     if (ohlcData.length === 0) return;
+    
+    // Sort array by time to prevent Lightweight Charts errors
+    ohlcData.sort((a, b) => (a.time as number) - (b.time as number));
+    
     ohlcDataRef.current = ohlcData;
 
     const chart = createChart(chartContainerRef.current, {
@@ -108,6 +146,7 @@ export const TVChart: React.FC<TVChartProps> = ({
       borderUpColor: '#FFFFFF', borderDownColor: '#FFFFFF', wickUpColor: '#FFFFFF', wickDownColor: '#FFFFFF',
     });
     candlestickSeries.setData(ohlcData);
+    candlestickSeriesRef.current = candlestickSeries;
 
     if (showVolume) {
       const volumeSeries = chart.addHistogramSeries({ 
@@ -116,9 +155,11 @@ export const TVChart: React.FC<TVChartProps> = ({
         priceScaleId: 'left', // Use the hidden left scale for the separate pane
       });
       const volData = sortedData.filter(d => d.Volume != null).map((d) => ({
-        time: d.Date, value: Number(d.Volume), color: 'rgba(0, 0, 0, 0.1)',
+        time: parseTime(d.Date), value: Number(d.Volume), color: 'rgba(0, 0, 0, 0.1)',
       })).filter(d => !isNaN(d.value));
+      volData.sort((a, b) => (a.time as number) - (b.time as number));
       volumeSeries.setData(volData);
+      volumeSeriesRef.current = volumeSeries;
     }
 
     if (showPivots) {
@@ -135,21 +176,33 @@ export const TVChart: React.FC<TVChartProps> = ({
         if (d.Resistance_Pivot != null && d.Is_Up_Rotation !== true) {
           const val = Number(d.Resistance_Pivot);
           if (!isNaN(val)) {
-            resPoints.push({ time: d.Date, value: val });
-            resMarkers.push({ time: d.Date, position: 'inBar', color: 'rgba(255, 50, 150, 0.5)', shape: 'circle', size: 0.1 });
+            const time = parseTime(d.Date);
+            resPoints.push({ time, value: val });
+            resMarkers.push({ time, position: 'inBar', color: 'rgba(255, 50, 150, 0.5)', shape: 'circle', size: 0.1 });
           }
         }
         if (d.Support_Pivot != null && d.Is_Down_Rotation !== true) {
           const val = Number(d.Support_Pivot);
           if (!isNaN(val)) {
-            supPoints.push({ time: d.Date, value: val });
-            supMarkers.push({ time: d.Date, position: 'inBar', color: 'rgba(50, 50, 255, 0.5)', shape: 'circle', size: 0.1 });
+            const time = parseTime(d.Date);
+            supPoints.push({ time, value: val });
+            supMarkers.push({ time, position: 'inBar', color: 'rgba(50, 50, 255, 0.5)', shape: 'circle', size: 0.1 });
           }
         }
       });
 
-      if (resPoints.length > 0) { resSeries.setData(resPoints); resSeries.setMarkers(resMarkers); }
-      if (supPoints.length > 0) { supSeries.setData(supPoints); supSeries.setMarkers(supMarkers); }
+      if (resPoints.length > 0) { 
+        resPoints.sort((a, b) => (a.time as number) - (b.time as number));
+        resMarkers.sort((a, b) => (a.time as number) - (b.time as number));
+        resSeries.setData(resPoints); 
+        resSeries.setMarkers(resMarkers); 
+      }
+      if (supPoints.length > 0) { 
+        supPoints.sort((a, b) => (a.time as number) - (b.time as number));
+        supMarkers.sort((a, b) => (a.time as number) - (b.time as number));
+        supSeries.setData(supPoints); 
+        supSeries.setMarkers(supMarkers); 
+      }
     }
 
     if (showTargets) {
@@ -157,10 +210,16 @@ export const TVChart: React.FC<TVChartProps> = ({
         color, lineWidth: 2, lineType: LineType.WithSteps,
         lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false,
       });
-      const upperData = sortedData.filter(d => d.Upper_Target != null).map(d => ({ time: d.Date, value: Number(d.Upper_Target) })).filter(d => !isNaN(d.value));
-      const lowerData = sortedData.filter(d => d.Lower_Target != null).map(d => ({ time: d.Date, value: Number(d.Lower_Target) })).filter(d => !isNaN(d.value));
-      if (upperData.length > 0) createTargetSeries('#3232FF').setData(upperData);
-      if (lowerData.length > 0) createTargetSeries('#FF3296').setData(lowerData);
+      const upperData = sortedData.filter(d => d.Upper_Target != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Upper_Target) })).filter(d => !isNaN(d.value));
+      const lowerData = sortedData.filter(d => d.Lower_Target != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Lower_Target) })).filter(d => !isNaN(d.value));
+      if (upperData.length > 0) {
+        upperData.sort((a, b) => (a.time as number) - (b.time as number));
+        createTargetSeries('#3232FF').setData(upperData);
+      }
+      if (lowerData.length > 0) {
+        lowerData.sort((a, b) => (a.time as number) - (b.time as number));
+        createTargetSeries('#FF3296').setData(lowerData);
+      }
     }
 
     setTimeout(() => { if (chartRef.current) applyRange(chartRef.current, ohlcData, rangeUpdateTrigger); }, 50);
