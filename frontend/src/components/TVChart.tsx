@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createChart, ColorType, CrosshairMode, LineType, IChartApi, ISeriesApi } from 'lightweight-charts';
 
 interface RangeTrigger {
@@ -9,6 +9,7 @@ interface RangeTrigger {
 
 interface TVChartProps {
   data: any[];
+  liveUpdate?: any;
   showPivots: boolean;
   showTargets: boolean;
   showVolume: boolean;
@@ -18,6 +19,7 @@ interface TVChartProps {
   rangeUpdateTrigger?: RangeTrigger | null;
   exportTrigger?: number;
   symbolName?: string;
+  layoutHeight?: number;
 }
 
 const parseTime = (dateStr: string) => {
@@ -34,42 +36,115 @@ const SOLAR_BASE3 = '#fdf6e3';
 const SOLAR_BASE01 = '#586e75';
 const SOLAR_BASE1 = '#93a1a1';
 
+type PaneId = 'volume' | 'breadth' | 'breakout' | 'correlation';
+
+const DEFAULT_PANE_HEIGHT = 80;
+const MIN_PANE_HEIGHT = 40;
+
 export const TVChart: React.FC<TVChartProps> = (props) => {
   const { data, showPivots, showTargets, showVolume, showBreadth, showBreakout, showCorrelation } = props;
-  const containerRef = useRef<HTMLDivElement>(null);
-  
-  // Containers (Always persistent in DOM)
-  const pRef = useRef<HTMLDivElement>(null);
-  const vRef = useRef<HTMLDivElement>(null);
-  const bRef = useRef<HTMLDivElement>(null);
-  const boRef = useRef<HTMLDivElement>(null);
-  const cRef = useRef<HTMLDivElement>(null);
-  
-  const charts = useRef<Record<string, IChartApi | null>>({});
-  const [priceHeight, setPriceHeight] = useState(50); 
-  const isDragging = useRef<boolean>(false);
 
+  const pRef  = useRef<HTMLDivElement>(null);
+  const vRef  = useRef<HTMLDivElement>(null);
+  const bRef  = useRef<HTMLDivElement>(null);
+  const boRef = useRef<HTMLDivElement>(null);
+  const cRef  = useRef<HTMLDivElement>(null);
+
+  const charts = useRef<Record<string, IChartApi | null>>({});
+  const seriesRefs = useRef<Record<string, ISeriesApi<any> | null>>({});
+  const dataLengthRef = useRef(0);
+  const timesRef = useRef<any[]>([]);
+
+  const [paneHeights, setPaneHeights] = useState<Record<PaneId, number>>({
+    volume:      DEFAULT_PANE_HEIGHT,
+    breadth:     DEFAULT_PANE_HEIGHT,
+    breakout:    DEFAULT_PANE_HEIGHT,
+    correlation: DEFAULT_PANE_HEIGHT,
+  });
+
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const prevWrapperHeightRef = useRef<number | null>(null);
+
+  // dragging state: track which resizer is being dragged
+  const dragging = useRef<{
+    isTopResizer: boolean;   // true = resizer between price and first indicator
+    topId: PaneId;           // pane above the resizer (for between-indicator case) or pane below (for top resizer)
+    bottomId?: PaneId;       // pane below the resizer (between-indicator case only)
+    startY: number;
+    startHeights: Record<PaneId, number>;
+  } | null>(null);
+
+  // Global mouse event handlers for dragging
   useEffect(() => {
     const onMouseMove = (e: MouseEvent) => {
-      if (!isDragging.current || !containerRef.current) return;
-      const rect = containerRef.current.getBoundingClientRect();
-      const pct = ((e.clientY - rect.top) / rect.height) * 100;
-      setPriceHeight(Math.max(20, Math.min(80, pct)));
+      if (!dragging.current) return;
+      const { isTopResizer, topId, bottomId, startY, startHeights } = dragging.current;
+      const deltaY = e.clientY - startY;
+
+      setPaneHeights(prev => {
+        const next = { ...prev };
+        if (isTopResizer) {
+          // Resizer between price pane and first indicator:
+          // drag down => indicator shrinks (price grows via flex:1)
+          // drag up   => indicator grows  (price shrinks via flex:1)
+          next[topId] = Math.max(MIN_PANE_HEIGHT, startHeights[topId] - deltaY);
+        } else if (bottomId) {
+          // Resizer between two indicator panes:
+          // drag down => top grows, bottom shrinks (total unchanged)
+          const total = startHeights[topId] + startHeights[bottomId];
+          const newTop = Math.max(MIN_PANE_HEIGHT, Math.min(total - MIN_PANE_HEIGHT, startHeights[topId] + deltaY));
+          next[topId]    = newTop;
+          next[bottomId] = Math.max(MIN_PANE_HEIGHT, total - newTop);
+        }
+        return next;
+      });
     };
-    const onMouseUp = () => { isDragging.current = false; document.body.style.cursor = 'default'; };
+
+    const onMouseUp = () => {
+      dragging.current = null;
+      document.body.style.cursor = 'default';
+    };
+
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mouseup', onMouseUp);
-    return () => { window.removeEventListener('mousemove', onMouseMove); window.removeEventListener('mouseup', onMouseUp); };
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
   }, []);
 
+  // Proportional scaling of indicator panes when the wrapper height changes
+  useEffect(() => {
+    const newH = wrapperRef.current?.clientHeight;
+    if (!newH) return;
+    const prevH = prevWrapperHeightRef.current;
+    if (prevH && prevH !== newH) {
+      const scale = newH / prevH;
+      setPaneHeights(prev => {
+        const next = { ...prev };
+        for (const key of Object.keys(next) as PaneId[]) {
+          next[key] = Math.max(MIN_PANE_HEIGHT, next[key] * scale);
+        }
+        return next;
+      });
+    }
+    prevWrapperHeightRef.current = newH;
+  }, [props.layoutHeight]);
+
+  // Chart creation — runs when data/pivots/targets change
   useEffect(() => {
     if (!pRef.current || data.length === 0) return;
 
     const sortedData = [...data].sort((a, b) => String(a.Date).localeCompare(String(b.Date)));
     const times = sortedData.map(d => parseTime(d.Date));
-    const ohlc = sortedData.map((d, i) => ({ time: times[i], open: Number(d.Open), high: Number(d.High), low: Number(d.Low), close: Number(d.Close) })).filter(d => !isNaN(d.open));
+    const ohlc = sortedData
+      .map((d, i) => ({ time: times[i], open: Number(d.Open), high: Number(d.High), low: Number(d.Low), close: Number(d.Close) }))
+      .filter(d => !isNaN(d.open));
 
-    const options = {
+    dataLengthRef.current = ohlc.length;
+    timesRef.current = times;
+
+    const chartOptions = {
       layout: { background: { type: ColorType.Solid, color: SOLAR_BASE3 }, textColor: SOLAR_BASE01 },
       grid: { vertLines: { visible: false }, horzLines: { visible: false } },
       crosshair: { mode: CrosshairMode.Normal },
@@ -78,27 +153,33 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
       handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
     };
 
-    // Init All 5 Charts on persistent refs
-    const pc = createChart(pRef.current, options);
-    const vc = createChart(vRef.current!, options);
-    const bc = createChart(bRef.current!, options);
-    const boc = createChart(boRef.current!, options);
-    const cc = createChart(cRef.current!, options);
+    const pc  = createChart(pRef.current,  chartOptions);
+    const vc  = createChart(vRef.current!,  chartOptions);
+    const bc  = createChart(bRef.current!,  chartOptions);
+    const boc = createChart(boRef.current!, chartOptions);
+    const cc  = createChart(cRef.current!,  chartOptions);
     charts.current = { price: pc, volume: vc, breadth: bc, breakout: boc, correlation: cc };
 
-    const candleS = pc.addCandlestickSeries({ upColor: 'transparent', downColor: SOLAR_BASE01, borderVisible: true, borderUpColor: SOLAR_BASE01, borderDownColor: SOLAR_BASE01, wickUpColor: SOLAR_BASE01, wickDownColor: SOLAR_BASE01 });
+    // Price pane
+    const candleS = pc.addCandlestickSeries({
+      upColor: 'transparent', downColor: SOLAR_BASE01,
+      borderVisible: true,
+      borderUpColor: SOLAR_BASE01, borderDownColor: SOLAR_BASE01,
+      wickUpColor: SOLAR_BASE01, wickDownColor: SOLAR_BASE01,
+    });
     candleS.setData(ohlc);
+    seriesRefs.current.price = candleS;
 
     if (showPivots) {
       const rs = pc.addLineSeries({ color: 'transparent', priceLineVisible: false, crosshairMarkerVisible: false });
       const ss = pc.addLineSeries({ color: 'transparent', priceLineVisible: false, crosshairMarkerVisible: false });
       const rp: any[] = [], sp: any[] = [], rm: any[] = [], sm: any[] = [];
       sortedData.forEach((d, i) => {
-        if (d.Resistance_Pivot != null && d.Is_Up_Rotation !== true) {
+        if (d.Resistance_Pivot != null && !d.Trend) {
           rp.push({ time: times[i], value: Number(d.Resistance_Pivot) });
           rm.push({ time: times[i], position: 'inBar', color: COLOR_PINK, shape: 'circle', size: 0.1 });
         }
-        if (d.Support_Pivot != null && d.Is_Down_Rotation !== true) {
+        if (d.Support_Pivot != null && d.Trend) {
           sp.push({ time: times[i], value: Number(d.Support_Pivot) });
           sm.push({ time: times[i], position: 'inBar', color: COLOR_BLUE, shape: 'circle', size: 0.1 });
         }
@@ -114,48 +195,179 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
       if (lT.length) pc.addLineSeries({ color: COLOR_PINK, lineWidth: 2, lineType: LineType.WithSteps, priceLineVisible: false }).setData(lT);
     }
 
-    vc.addHistogramSeries({ color: 'rgba(147, 161, 161, 0.5)', priceFormat: { type: 'volume' } }).setData(sortedData.filter(d => d.Volume != null).map((d, i) => ({ time: times[i], value: Number(d.Volume) })));
-    bc.addLineSeries({ color: COLOR_BLUE, lineWidth: 2, title: 'Breadth %' }).setData(sortedData.filter(d => d.Uptrend_Pct != null).map((d, i) => ({ time: times[i], value: Number(d.Uptrend_Pct) * 100 })));
-    boc.addLineSeries({ color: COLOR_PINK, lineWidth: 2, title: 'Breakout %' }).setData(sortedData.filter(d => d.Breakout_Pct != null).map((d, i) => ({ time: times[i], value: Number(d.Breakout_Pct) * 100 })));
-    cc.addLineSeries({ color: SOLAR_BASE01, lineWidth: 2, title: 'Correlation %' }).setData(sortedData.filter(d => d.Correlation_Pct != null).map((d, i) => ({ time: times[i], value: Number(d.Correlation_Pct) * 100 })));
+    // Indicator panes — same pattern as volume for all
+    const volSeries = vc.addHistogramSeries({ color: 'rgba(147, 161, 161, 0.5)', priceFormat: { type: 'volume' } });
+    volSeries.setData(sortedData.filter(d => d.Volume != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Volume) })));
+    seriesRefs.current.volume = volSeries;
 
-    const list = [pc, vc, bc, boc, cc];
-    let syncing = false;
-    list.forEach(c => {
-      c.timeScale().subscribeVisibleLogicalRangeChange(r => { if (!syncing && r) { syncing = true; list.forEach(o => { if (o !== c) o.timeScale().setVisibleLogicalRange(r); }); syncing = false; } });
-      c.subscribeCrosshairMove(p => { if (!syncing) { syncing = true; list.forEach(o => { if (o !== c) { if (!p.time) o.clearCrosshairPosition(); else o.setCrosshairPosition(0 as any, p.time as any, null as any); } }); syncing = false; } });
+    const breadthSeries = bc.addLineSeries({ color: COLOR_BLUE, lineWidth: 2, title: 'Breadth %' });
+    breadthSeries.setData(sortedData.filter(d => d.Uptrend_Pct != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Uptrend_Pct) })));
+    seriesRefs.current.breadth = breadthSeries;
+
+    const breakoutSeries = boc.addLineSeries({ color: COLOR_PINK, lineWidth: 2, title: 'Breakout %' });
+    breakoutSeries.setData(sortedData.filter(d => d.Breakout_Pct != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Breakout_Pct) })));
+    seriesRefs.current.breakout = breakoutSeries;
+
+    const corrSeries = cc.addLineSeries({ color: SOLAR_BASE01, lineWidth: 2, title: 'Correlation %' });
+    corrSeries.setData(sortedData.filter(d => d.Correlation_Pct != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Correlation_Pct) * 100 })));
+    seriesRefs.current.correlation = corrSeries;
+
+    // Invisible alignment series: gives every indicator chart the full price-chart time scale
+    // so setVisibleRange works even when the indicator has no (or fewer) data points.
+    const alignData = ohlc.map(d => ({ time: d.time, value: d.close }));
+    [vc, bc, boc, cc].forEach(ic => {
+      ic.addLineSeries({ color: 'rgba(0,0,0,0)', priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: false, priceScaleId: '__align__' })
+        .setData(alignData);
+      ic.priceScale('__align__').applyOptions({ visible: false });
     });
 
-    pc.timeScale().setVisibleLogicalRange({ from: ohlc.length - 253, to: ohlc.length + 19 });
+    // Sync time scales and crosshairs across all charts
+    const chartEntries: [string, IChartApi][] = [
+      ['price', pc], ['volume', vc], ['breadth', bc], ['breakout', boc], ['correlation', cc],
+    ];
+    let rangeSyncing = false;
+    let crosshairSyncing = false;
+    chartEntries.forEach(([, source]) => {
+      source.timeScale().subscribeVisibleLogicalRangeChange(r => {
+        if (rangeSyncing || !r) return;
+        rangeSyncing = true;
+        chartEntries.forEach(([, target]) => { if (target !== source) target.timeScale().setVisibleLogicalRange(r); });
+        rangeSyncing = false;
+      });
+      source.subscribeCrosshairMove(p => {
+        if (crosshairSyncing) return;
+        crosshairSyncing = true;
+        chartEntries.forEach(([otherId, target]) => {
+          if (target !== source) {
+            if (!p.time) target.clearCrosshairPosition();
+            else target.setCrosshairPosition(0 as any, p.time as any, seriesRefs.current[otherId]!);
+          }
+        });
+        crosshairSyncing = false;
+      });
+    });
 
-    return () => list.forEach(c => c.remove());
+    const initRange = { from: ohlc.length - 252, to: ohlc.length + 20 };
+    chartEntries.forEach(([, c]) => c.timeScale().setVisibleLogicalRange(initRange));
+
+    return () => chartEntries.forEach(([, c]) => c.remove());
   }, [data, showPivots, showTargets]);
 
+  // Resize charts whenever pane heights or visibility changes
   useEffect(() => {
+    const refMap: Record<string, React.RefObject<HTMLDivElement>> = {
+      price: pRef, volume: vRef, breadth: bRef, breakout: boRef, correlation: cRef,
+    };
+    const visMap: Record<string, boolean> = {
+      price: true, volume: !!showVolume, breadth: !!showBreadth, breakout: !!showBreakout, correlation: !!showCorrelation,
+    };
+
     const resize = () => {
+      const priceChart = charts.current.price;
+      const currentRange = priceChart?.timeScale().getVisibleLogicalRange();
+
       Object.entries(charts.current).forEach(([id, chart]) => {
-        const ref: any = { price: pRef, volume: vRef, breadth: bRef, breakout: boRef, correlation: cRef }[id];
-        if (chart && ref.current) chart.applyOptions({ width: ref.current.clientWidth, height: ref.current.clientHeight });
+        const ref = refMap[id];
+        if (chart && ref.current && visMap[id]) {
+          chart.applyOptions({ width: ref.current.clientWidth, height: ref.current.clientHeight });
+          if (id !== 'price' && currentRange) {
+            chart.timeScale().setVisibleLogicalRange(currentRange);
+          }
+        }
       });
     };
+
     resize();
     window.addEventListener('resize', resize);
     return () => window.removeEventListener('resize', resize);
-  }, [priceHeight, showVolume, showBreadth, showBreakout, showCorrelation]);
+  }, [paneHeights, showVolume, showBreadth, showBreakout, showCorrelation, props.layoutHeight]);
 
-  const activeCount = [showVolume, showBreadth, showBreakout, showCorrelation].filter(Boolean).length;
-  const indicatorFlex = activeCount > 0 ? (100 - priceHeight) / activeCount : 0;
+  // Handle rangeUpdateTrigger (Reset 1Y button and date range picker)
+  useEffect(() => {
+    if (!props.rangeUpdateTrigger) return;
+
+    const setRange = (range: { from: number; to: number }) => {
+      Object.values(charts.current).forEach(c => {
+        if (c) c.timeScale().setVisibleLogicalRange(range);
+      });
+    };
+
+    if (props.rangeUpdateTrigger.reset1Y) {
+      setRange({ from: dataLengthRef.current - 252, to: dataLengthRef.current + 20 });
+      return;
+    }
+
+    if (props.rangeUpdateTrigger.from || props.rangeUpdateTrigger.to) {
+      const times = timesRef.current;
+      const findBarIndex = (dateStr: string) => {
+        const t = parseTime(dateStr);
+        let lo = 0, hi = times.length - 1;
+        while (lo < hi) {
+          const mid = Math.floor((lo + hi) / 2);
+          if (times[mid] < t) lo = mid + 1;
+          else hi = mid;
+        }
+        return lo;
+      };
+      const from = props.rangeUpdateTrigger.from ? findBarIndex(props.rangeUpdateTrigger.from) : 0;
+      const to = props.rangeUpdateTrigger.to ? findBarIndex(props.rangeUpdateTrigger.to) : dataLengthRef.current + 20;
+      setRange({ from, to });
+    }
+  }, [props.rangeUpdateTrigger]);
+
+  // Ordered indicator pane definitions
+  const allPanes: { id: PaneId; ref: React.RefObject<HTMLDivElement>; visible: boolean }[] = [
+    { id: 'volume',      ref: vRef,  visible: !!showVolume },
+    { id: 'breadth',     ref: bRef,  visible: !!showBreadth },
+    { id: 'breakout',    ref: boRef, visible: !!showBreakout },
+    { id: 'correlation', ref: cRef,  visible: !!showCorrelation },
+  ];
+  const activePanes = allPanes.filter(p => p.visible);
 
   return (
-    <div ref={containerRef} className="tv-chart-wrapper" style={{ display: 'flex', flexDirection: 'column' }}>
-      <div ref={pRef} style={{ flex: `0 0 ${activeCount > 0 ? priceHeight : 100}%`, minHeight: '100px' }} />
-      
-      <div className="pane-resizer" onMouseDown={() => { isDragging.current = true; }} style={{ display: activeCount > 0 ? 'block' : 'none', height: '6px', cursor: 'ns-resize', background: SOLAR_BASE1, flexShrink: 0 }} />
-      
-      <div ref={vRef} style={{ display: showVolume ? 'block' : 'none', flex: `0 0 ${indicatorFlex}%`, minHeight: '50px' }} />
-      <div ref={bRef} style={{ display: showBreadth ? 'block' : 'none', flex: `0 0 ${indicatorFlex}%`, minHeight: '50px', borderTop: showVolume ? `1px solid ${SOLAR_BASE1}` : 'none' }} />
-      <div ref={boRef} style={{ display: showBreakout ? 'block' : 'none', flex: `0 0 ${indicatorFlex}%`, minHeight: '50px', borderTop: (showVolume || showBreadth) ? `1px solid ${SOLAR_BASE1}` : 'none' }} />
-      <div ref={cRef} style={{ display: showCorrelation ? 'block' : 'none', flex: `0 0 ${indicatorFlex}%`, minHeight: '50px', borderTop: (showVolume || showBreadth || showBreakout) ? `1px solid ${SOLAR_BASE1}` : 'none' }} />
+    <div ref={wrapperRef} className="tv-chart-wrapper" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+
+      {/* Price pane: flex:1 takes all space not consumed by indicator panes */}
+      <div ref={pRef} style={{ flex: 1, minHeight: '100px' }} />
+
+      {/* Unified pane loop — stable DOM identity regardless of visibility */}
+      {allPanes.map((pane) => {
+        const activeIdx = activePanes.findIndex(p => p.id === pane.id);
+        const isActive = activeIdx !== -1;
+        const prevPane = isActive && activeIdx > 0 ? activePanes[activeIdx - 1] : null;
+        const isFirstActive = activeIdx === 0;
+        return (
+          <React.Fragment key={pane.id}>
+            {isActive && (
+              <div
+                className="pane-resizer"
+                style={{ height: '6px', cursor: 'ns-resize', background: SOLAR_BASE1, flexShrink: 0 }}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  dragging.current = {
+                    isTopResizer: isFirstActive,
+                    topId:    isFirstActive ? pane.id : prevPane!.id,
+                    bottomId: isFirstActive ? undefined : pane.id,
+                    startY: e.clientY,
+                    startHeights: { ...paneHeights },
+                  };
+                  document.body.style.cursor = 'ns-resize';
+                }}
+              />
+            )}
+            <div
+              ref={pane.ref}
+              style={{
+                height: isActive ? `${paneHeights[pane.id]}px` : 0,
+                minHeight: isActive ? `${MIN_PANE_HEIGHT}px` : 0,
+                display: isActive ? undefined : 'none',
+                flexShrink: 0,
+              }}
+            />
+          </React.Fragment>
+        );
+      })}
+
     </div>
   );
 };

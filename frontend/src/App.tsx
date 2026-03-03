@@ -1,4 +1,4 @@
-import { useEffect, useState, Component, ReactNode } from 'react'
+import { useEffect, useState, useRef, Component, ReactNode } from 'react'
 import axios from 'axios'
 import { TVChart } from './components/TVChart'
 import { BasketSummary } from './components/BasketSummary'
@@ -74,9 +74,9 @@ function App() {
   const [showPivots, setShowPivots] = useState(true)
   const [showTargets, setShowTargets] = useState(true)
   const [showVolume, setShowVolume] = useState(true)
-  const [showBreadth, setShowBreadth] = useState(false)
-  const [showBreakout, setShowBreakout] = useState(false)
-  const [showCorrelation, setShowCorrelation] = useState(false)
+  const [showBreadth, setShowBreadth] = useState(true)
+  const [showBreakout, setShowBreakout] = useState(true)
+  const [showCorrelation, setShowCorrelation] = useState(true)
   const [startDate, setStartDate] = useState('')
   const [endDate, setEndDate] = useState('')
   const [rangeUpdateTrigger, setRangeUpdateTrigger] = useState<{from?: string, to?: string, reset1Y?: boolean} | null>(null)
@@ -84,6 +84,9 @@ function App() {
   const [showSummary, setShowSummary] = useState(false)
   const [summaryData, setSummaryData] = useState<BasketSummaryData | null>(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
+  const [chartHeightPct, setChartHeightPct] = useState(50)
+  const summaryDrag = useRef<{ startY: number; startPct: number; stackH: number } | null>(null)
+  const contentStackRef = useRef<HTMLDivElement>(null)
 
   const isBasketView = viewType !== 'Tickers' && !activeTicker
   const canShowSummary = isBasketView && timeframe === 'Daily'
@@ -121,19 +124,33 @@ function App() {
 
     // Setup WebSocket for live updates if viewing a ticker
     let ws: WebSocket | null = null;
+    let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+    let cancelled = false;
+
     if (viewType === 'Tickers' || isViewingBasketConstituent) {
       const wsUrl = `ws://${API_HOSTNAME}:8000/ws/live/${encodeURIComponent(targetItem as string)}`;
-      ws = new WebSocket(wsUrl);
-      ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        if (!data.error) {
-          setLiveUpdate(data);
-        }
+
+      const connect = () => {
+        if (cancelled) return;
+        ws = new WebSocket(wsUrl);
+        ws.onmessage = (event) => {
+          const data = JSON.parse(event.data);
+          if (!data.error) {
+            setLiveUpdate(data);
+          }
+        };
+        ws.onerror = (err) => console.error("WebSocket error:", err);
+        ws.onclose = () => {
+          if (!cancelled) reconnectTimeout = setTimeout(connect, 3000);
+        };
       };
-      ws.onerror = (err) => console.error("WebSocket error:", err);
+
+      connect();
     }
 
     return () => {
+      cancelled = true;
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
       if (ws) ws.close();
     };
   }, [selectedItem, viewType, activeTicker, timeframe])
@@ -165,6 +182,26 @@ function App() {
       cancelled = true
     }
   }, [canShowSummary, selectedItem, showSummary])
+
+  useEffect(() => {
+    const onMouseMove = (e: MouseEvent) => {
+      if (!summaryDrag.current) return;
+      const { startY, startPct, stackH } = summaryDrag.current;
+      const deltaY = e.clientY - startY;
+      const newPct = Math.max(20, Math.min(80, startPct + (deltaY / stackH) * 100));
+      setChartHeightPct(newPct);
+    };
+    const onMouseUp = () => {
+      summaryDrag.current = null;
+      document.body.style.cursor = 'default';
+    };
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+  }, []);
 
   const handleViewTypeChange = (type: ViewType) => {
     setViewType(type); setActiveTicker(null); setTimeframe('Daily'); setShowSummary(false); setSummaryData(null)
@@ -253,12 +290,14 @@ function App() {
               <button className="control-btn" onClick={() => setExportTrigger(p => p + 1)}>Export Image</button>
             </div>
           </div>
-          <div className={`content-stack ${showSummary ? 'with-summary' : ''}`}>
-            <div className="chart-container">
+          <div className={`content-stack ${showSummary ? 'with-summary' : ''}`} ref={contentStackRef}>
+            <div className="chart-container" style={showSummary ? { flex: `0 0 ${chartHeightPct}%` } : undefined}>
             <div className="chart-overlay-toggles">
               <label className="overlay-checkbox"><input type="checkbox" checked={showPivots} onChange={e => setShowPivots(e.target.checked)} /> Pivots</label>
               <label className="overlay-checkbox"><input type="checkbox" checked={showTargets} onChange={e => setShowTargets(e.target.checked)} /> Targets</label>
-              <label className="overlay-checkbox"><input type="checkbox" checked={showVolume} onChange={e => setShowVolume(e.target.checked)} /> Volume</label>
+              {!isBasketView && (
+                <label className="overlay-checkbox"><input type="checkbox" checked={showVolume} onChange={e => setShowVolume(e.target.checked)} /> Volume</label>
+              )}
               {isBasketView && (
                 <>
                   <label className="overlay-checkbox"><input type="checkbox" checked={showBreadth} onChange={e => setShowBreadth(e.target.checked)} /> Breadth%</label>
@@ -268,25 +307,40 @@ function App() {
               )}
             </div>
             {chartData && chartData.length > 0 ? (
-              <TVChart 
+              <TVChart
                 key={`${viewType}_${activeTicker || selectedItem}_${timeframe}`}
-                data={chartData} 
-                liveUpdate={liveUpdate} 
-                showPivots={showPivots} 
-                showTargets={showTargets} 
-                showVolume={showVolume} 
-                showBreadth={showBreadth}
-                showBreakout={showBreakout}
-                showCorrelation={showCorrelation}
-                rangeUpdateTrigger={rangeUpdateTrigger} 
-                exportTrigger={exportTrigger} 
-                symbolName={activeTicker || selectedItem} 
+                data={chartData}
+                liveUpdate={liveUpdate}
+                showPivots={showPivots}
+                showTargets={showTargets}
+                showVolume={showVolume && !isBasketView}
+                showBreadth={showBreadth && isBasketView}
+                showBreakout={showBreakout && isBasketView}
+                showCorrelation={showCorrelation && isBasketView}
+                rangeUpdateTrigger={rangeUpdateTrigger}
+                exportTrigger={exportTrigger}
+                symbolName={activeTicker || selectedItem}
+                layoutHeight={showSummary ? chartHeightPct : undefined}
               />
             ) : (
 
               <div className="no-data">{selectedItem ? "No data found" : "Select an item"}</div>
             )}
             </div>
+            {showSummary && (
+              <div
+                className="summary-resizer"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  summaryDrag.current = {
+                    startY: e.clientY,
+                    startPct: chartHeightPct,
+                    stackH: contentStackRef.current?.clientHeight ?? 600,
+                  };
+                  document.body.style.cursor = 'ns-resize';
+                }}
+              />
+            )}
             {showSummary && (
               <BasketSummary data={summaryData} loading={summaryLoading} />
             )}

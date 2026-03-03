@@ -224,11 +224,18 @@ html, body, #root {
   flex: 1;
   position: relative;
   min-height: 0;
+  overflow: hidden;
 }
 
-.content-stack.with-summary .chart-container {
-  flex: 0 0 50%;
-  border-bottom: 2px solid var(--border-color);
+.summary-resizer {
+  height: 8px;
+  cursor: ns-resize;
+  background: var(--base01);
+  flex-shrink: 0;
+}
+
+.summary-resizer:hover {
+  background: var(--base00);
 }
 
 .tv-chart-wrapper {
@@ -243,9 +250,10 @@ html, body, #root {
   left: 12px;
   z-index: 100;
   display: flex;
-  gap: 8px;
+  flex-direction: column;
+  gap: 6px;
   background-color: var(--bg-sidebar);
-  padding: 4px;
+  padding: 6px 8px;
   border: 2px solid var(--border-color);
 }
 
@@ -292,6 +300,12 @@ html, body, #root {
   background: var(--bg-main);
 }
 
+.summary-content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
 .summary-tabs {
   display: flex;
   gap: 2px;
@@ -315,6 +329,29 @@ html, body, #root {
   background: var(--color-blue) !important;
   border-color: var(--color-blue) !important;
   color: #ffffff !important;
+}
+
+/* Signals tab — horizontal scroll for wide table */
+.summary-table-wrapper {
+  overflow-x: auto;
+}
+
+/* Correlation tab — horizontal scroll for wide heatmap */
+.corr-scroll {
+  overflow-x: auto;
+}
+
+/* Returns tab — canvas chart fills available space */
+.returns-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.returns-chart {
+  flex: 1;
+  min-height: 0;
 }
 
 .summary-th {

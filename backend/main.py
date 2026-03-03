@@ -49,7 +49,7 @@ app.add_middleware(
 # Look for 'DATA_PATH' in environment variables, 
 # otherwise default to the relative path where your data usually is.
 DEFAULT_PATH = Path.home() / "Documents" / "Python_Outputs"
-BASE_DIR = Path(os.getenv("TRADING_DATA_PATH", str(DEFAULT_PATH)))
+BASE_DIR = Path(os.getenv("PYTHON_OUTPUTS_DIR", str(DEFAULT_PATH)))
 
 BASKET_EQUITY_CACHE = BASE_DIR / "Pickle_Files" / "basket_equity_cache"
 BASKET_SIGNALS_CACHE = BASE_DIR / "Pickle_Files" / "basket_signals_cache"
@@ -222,6 +222,10 @@ def list_baskets():
 
 CORRELATION_FILE = BASE_DIR / "Pickle_Files" / "correlation_cache" / "within_osc_500.parquet"
 
+logger.info(f"BASE_DIR: {BASE_DIR} (exists={BASE_DIR.exists()})")
+logger.info(f"BASKET_SIGNALS_CACHE: {BASKET_SIGNALS_CACHE} (exists={BASKET_SIGNALS_CACHE.exists()})")
+logger.info(f"CORRELATION_FILE: {CORRELATION_FILE} (exists={CORRELATION_FILE.exists()})")
+
 def get_basket_correlation(basket_name):
     if not CORRELATION_FILE.exists():
         return pd.Series(dtype=float)
@@ -233,9 +237,11 @@ def get_basket_correlation(basket_name):
         col_name = f"21|{search_name}"
         
         if col_name not in df_all.columns:
-            # Fallback: case-insensitive search or partial match
+            # Fallback: case-insensitive partial match, normalizing & vs and
+            search_norm = search_name.lower().replace(" & ", " and ")
             for col in df_all.columns:
-                if search_name.lower() in col.lower():
+                col_norm = col.lower().replace(" & ", " and ")
+                if search_norm in col_norm:
                     col_name = col
                     break
         
@@ -276,9 +282,6 @@ def get_basket_data(basket_name: str):
             df = pd.merge(df, corr_df, on='Date', how='left')
             logger.info(f"Merged chart data rows: {len(df)}, Non-null Correlation: {df['Correlation_Pct'].notna().sum()}")
         
-        if 'Uptrend_Pct_x' in df.columns: df['Uptrend_Pct'] = df['Uptrend_Pct_x']
-        if 'Breakout_Pct_x' in df.columns: df['Breakout_Pct'] = df['Breakout_Pct_x']
-
         latest_universe = get_latest_universe_tickers(basket_name)
         tickers = []
         current_weights = compute_current_basket_weights(latest_universe) if latest_universe else {}
