@@ -74,6 +74,9 @@ function App() {
   const [showPivots, setShowPivots] = useState(true)
   const [showTargets, setShowTargets] = useState(true)
   const [showVolume, setShowVolume] = useState(true)
+  const [showBreadth, setShowBreadth] = useState(false)
+  const [showBreakout, setShowBreakout] = useState(false)
+  const [showCorrelation, setShowCorrelation] = useState(false)
   const [startDate, setStartDate] = useState('')
   const [endDate, setEndDate] = useState('')
   const [rangeUpdateTrigger, setRangeUpdateTrigger] = useState<{from?: string, to?: string, reset1Y?: boolean} | null>(null)
@@ -256,10 +259,31 @@ function App() {
               <label className="overlay-checkbox"><input type="checkbox" checked={showPivots} onChange={e => setShowPivots(e.target.checked)} /> Pivots</label>
               <label className="overlay-checkbox"><input type="checkbox" checked={showTargets} onChange={e => setShowTargets(e.target.checked)} /> Targets</label>
               <label className="overlay-checkbox"><input type="checkbox" checked={showVolume} onChange={e => setShowVolume(e.target.checked)} /> Volume</label>
+              {isBasketView && (
+                <>
+                  <label className="overlay-checkbox"><input type="checkbox" checked={showBreadth} onChange={e => setShowBreadth(e.target.checked)} /> Breadth%</label>
+                  <label className="overlay-checkbox"><input type="checkbox" checked={showBreakout} onChange={e => setShowBreakout(e.target.checked)} /> Breakout%</label>
+                  <label className="overlay-checkbox"><input type="checkbox" checked={showCorrelation} onChange={e => setShowCorrelation(e.target.checked)} /> Correlation%</label>
+                </>
+              )}
             </div>
             {chartData && chartData.length > 0 ? (
-              <TVChart data={chartData} liveUpdate={liveUpdate} showPivots={showPivots} showTargets={showTargets} showVolume={showVolume} rangeUpdateTrigger={rangeUpdateTrigger} exportTrigger={exportTrigger} symbolName={activeTicker || selectedItem} />
+              <TVChart 
+                key={`${viewType}_${activeTicker || selectedItem}_${timeframe}`}
+                data={chartData} 
+                liveUpdate={liveUpdate} 
+                showPivots={showPivots} 
+                showTargets={showTargets} 
+                showVolume={showVolume} 
+                showBreadth={showBreadth}
+                showBreakout={showBreakout}
+                showCorrelation={showCorrelation}
+                rangeUpdateTrigger={rangeUpdateTrigger} 
+                exportTrigger={exportTrigger} 
+                symbolName={activeTicker || selectedItem} 
+              />
             ) : (
+
               <div className="no-data">{selectedItem ? "No data found" : "Select an item"}</div>
             )}
             </div>

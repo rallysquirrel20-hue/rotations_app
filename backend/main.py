@@ -220,44 +220,73 @@ def list_baskets():
     for k in cats: cats[k].sort()
     return cats
 
+CORRELATION_FILE = BASE_DIR / "Pickle_Files" / "correlation_cache" / "within_osc_500.parquet"
+
+def get_basket_correlation(basket_name):
+    if not CORRELATION_FILE.exists():
+        return pd.Series(dtype=float)
+    try:
+        df_all = pd.read_parquet(CORRELATION_FILE)
+        
+        # Try exact match first
+        search_name = basket_name.replace("_", " ")
+        col_name = f"21|{search_name}"
+        
+        if col_name not in df_all.columns:
+            # Fallback: case-insensitive search or partial match
+            for col in df_all.columns:
+                if search_name.lower() in col.lower():
+                    col_name = col
+                    break
+        
+        if col_name not in df_all.columns:
+            logger.warning(f"Correlation column not found for {basket_name}")
+            return pd.Series(dtype=float)
+            
+        df = df_all[[col_name]].copy()
+        df = df.reset_index()
+        df.columns = ['Date', 'Correlation_Pct']
+        df['Date'] = pd.to_datetime(df['Date'])
+        return df
+    except Exception as e:
+        logger.error(f"Error loading pre-calculated correlation for {basket_name}: {e}")
+        return pd.Series(dtype=float)
+
 @app.get("/api/baskets/{basket_name}")
 def get_basket_data(basket_name: str):
     ohlc_file = BASKET_EQUITY_CACHE / f"{basket_name}_equity_ohlc.parquet"
     signals_file = BASKET_SIGNALS_CACHE / f"{basket_name}_basket_signals.parquet"
-    meta_file = BASKET_EQUITY_CACHE / f"{basket_name}_equity_meta.json"
     if not ohlc_file.exists(): raise HTTPException(status_code=404)
     try:
         df_ohlc = pd.read_parquet(ohlc_file)
-        if 'Date' in df_ohlc.columns: df_ohlc['Date'] = pd.to_datetime(df_ohlc['Date']).dt.strftime('%Y-%m-%d')
         if signals_file.exists():
             df_s = pd.read_parquet(signals_file)
-            if 'Date' in df_s.columns: df_s['Date'] = pd.to_datetime(df_s['Date']).dt.strftime('%Y-%m-%d')
+            df_ohlc['Date'] = pd.to_datetime(df_ohlc['Date'])
+            df_s['Date'] = pd.to_datetime(df_s['Date'])
             df = pd.merge(df_ohlc, df_s.drop(columns=[c for c in ['Open','High','Low','Close','Volume'] if c in df_s.columns]), on='Date', how='left')
-        else: df = df_ohlc
-        tickers = []
+        else:
+            df = df_ohlc
+            df['Date'] = pd.to_datetime(df['Date'])
+
+        # LOAD PRE-CALCULATED CORRELATION
+        corr_df = get_basket_correlation(basket_name)
+        logger.info(f"Loaded correlation data for {basket_name}: {len(corr_df)} rows")
+        
+        if not corr_df.empty:
+            df = pd.merge(df, corr_df, on='Date', how='left')
+            logger.info(f"Merged chart data rows: {len(df)}, Non-null Correlation: {df['Correlation_Pct'].notna().sum()}")
+        
+        if 'Uptrend_Pct_x' in df.columns: df['Uptrend_Pct'] = df['Uptrend_Pct_x']
+        if 'Breakout_Pct_x' in df.columns: df['Breakout_Pct'] = df['Breakout_Pct_x']
+
         latest_universe = get_latest_universe_tickers(basket_name)
-        meta_weights = get_meta_file_weights(basket_name)
-
-        current_weights = {}
-        if latest_universe:
-            current_weights = compute_current_basket_weights(latest_universe)
-
+        tickers = []
+        current_weights = compute_current_basket_weights(latest_universe) if latest_universe else {}
         if current_weights:
-            symbols = list(current_weights.keys())
-            tickers = sorted(
-                [{"symbol": symbol, "weight": float(current_weights.get(symbol, 0.0))} for symbol in symbols],
-                key=lambda x: x['weight'],
-                reverse=True,
-            )
-        elif meta_weights:
-            symbols = list(meta_weights.keys())
-            tickers = sorted(
-                [{"symbol": symbol, "weight": float(meta_weights.get(symbol, 0.0))} for symbol in symbols],
-                key=lambda x: x['weight'],
-                reverse=True,
-            )
+            tickers = sorted([{"symbol": s, "weight": float(w)} for s, w in current_weights.items()], key=lambda x: x['weight'], reverse=True)
         elif latest_universe:
             tickers = [{"symbol": symbol, "weight": 0.0} for symbol in latest_universe]
+            
         return {"chart_data": clean_data_for_json(df), "tickers": tickers}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 

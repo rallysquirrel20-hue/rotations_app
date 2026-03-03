@@ -1,5 +1,5 @@
-import React, { useEffect, useRef } from 'react';
-import { createChart, ColorType, CrosshairMode, LineType, IChartApi } from 'lightweight-charts';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import { createChart, ColorType, CrosshairMode, LineType, IChartApi, ISeriesApi } from 'lightweight-charts';
 
 interface RangeTrigger {
   from?: string;
@@ -9,10 +9,12 @@ interface RangeTrigger {
 
 interface TVChartProps {
   data: any[];
-  liveUpdate?: any;
   showPivots: boolean;
   showTargets: boolean;
   showVolume: boolean;
+  showBreadth?: boolean;
+  showBreakout?: boolean;
+  showCorrelation?: boolean;
   rangeUpdateTrigger?: RangeTrigger | null;
   exportTrigger?: number;
   symbolName?: string;
@@ -20,213 +22,140 @@ interface TVChartProps {
 
 const parseTime = (dateStr: string) => {
   if (typeof dateStr === 'string' && dateStr.includes('T')) {
-    // NOMINAL TIME FIX:
-    // We treat the incoming "YYYY-MM-DDTHH:mm:ss" string as if it were UTC.
-    // This prevents the browser from shifting the New York hours based on the user's local timezone.
     const d = new Date(dateStr.endsWith('Z') ? dateStr : dateStr + 'Z');
     return Math.floor(d.getTime() / 1000) as any;
   }
   return dateStr;
 };
 
-export const TVChart: React.FC<TVChartProps> = ({ 
-  data, liveUpdate, showPivots, showTargets, showVolume, rangeUpdateTrigger, exportTrigger, symbolName 
-}) => {
-  const chartContainerRef = useRef<HTMLDivElement>(null);
-  const chartRef = useRef<IChartApi | null>(null);
-  const candlestickSeriesRef = useRef<any>(null);
-  const volumeSeriesRef = useRef<any>(null);
-  const ohlcDataRef = useRef<any[]>([]);
-  const lastExportTriggerRef = useRef<number>(exportTrigger || 0);
+const COLOR_PINK = 'rgb(255, 50, 150)';
+const COLOR_BLUE = 'rgb(50, 50, 255)';
+const SOLAR_BASE3 = '#fdf6e3';
+const SOLAR_BASE01 = '#586e75';
+const SOLAR_BASE1 = '#93a1a1';
 
-  const applyRange = (chart: IChartApi, ohlcData: any[], trigger?: RangeTrigger | null) => {
-    if (ohlcData.length === 0) return;
-    try {
-      const timeScale = chart.timeScale();
-      const lastIndex = ohlcData.length - 1;
-      if (trigger?.reset1Y || !trigger) {
-        timeScale.setVisibleLogicalRange({ from: lastIndex - 252, to: lastIndex + 20 });
-      } else if (trigger.from || trigger.to) {
-        const from = trigger.from ? parseTime(trigger.from) : ohlcData[0].time;
-        const to = trigger.to ? parseTime(trigger.to) : ohlcData[lastIndex].time;
-        timeScale.setVisibleRange({ from: from as any, to: to as any });
-      }
-    } catch (e) { console.error("Error setting range:", e); }
-  };
-
-  // FIX: Export handling - only fire if trigger INCREASES
-  useEffect(() => {
-    if (exportTrigger && exportTrigger > lastExportTriggerRef.current && chartRef.current) {
-      const canvas = chartRef.current.takeScreenshot();
-      const dataUrl = canvas.toDataURL('image/png');
-      const link = document.createElement('a');
-      link.download = `${symbolName || 'chart'}_${new Date().toISOString().split('T')[0]}.png`;
-      link.href = dataUrl;
-      link.click();
-    }
-    lastExportTriggerRef.current = exportTrigger || 0;
-  }, [exportTrigger, symbolName]);
+export const TVChart: React.FC<TVChartProps> = (props) => {
+  const { data, showPivots, showTargets, showVolume, showBreadth, showBreakout, showCorrelation } = props;
+  const containerRef = useRef<HTMLDivElement>(null);
+  
+  // Containers (Always persistent in DOM)
+  const pRef = useRef<HTMLDivElement>(null);
+  const vRef = useRef<HTMLDivElement>(null);
+  const bRef = useRef<HTMLDivElement>(null);
+  const boRef = useRef<HTMLDivElement>(null);
+  const cRef = useRef<HTMLDivElement>(null);
+  
+  const charts = useRef<Record<string, IChartApi | null>>({});
+  const [priceHeight, setPriceHeight] = useState(50); 
+  const isDragging = useRef<boolean>(false);
 
   useEffect(() => {
-    if (chartRef.current && ohlcDataRef.current.length > 0 && rangeUpdateTrigger) {
-      applyRange(chartRef.current, ohlcDataRef.current, rangeUpdateTrigger);
-    }
-  }, [rangeUpdateTrigger]);
+    const onMouseMove = (e: MouseEvent) => {
+      if (!isDragging.current || !containerRef.current) return;
+      const rect = containerRef.current.getBoundingClientRect();
+      const pct = ((e.clientY - rect.top) / rect.height) * 100;
+      setPriceHeight(Math.max(20, Math.min(80, pct)));
+    };
+    const onMouseUp = () => { isDragging.current = false; document.body.style.cursor = 'default'; };
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    return () => { window.removeEventListener('mousemove', onMouseMove); window.removeEventListener('mouseup', onMouseUp); };
+  }, []);
 
   useEffect(() => {
-    if (liveUpdate && candlestickSeriesRef.current) {
-      const parsedTime = parseTime(liveUpdate.time);
-      const parsedUpdate = { ...liveUpdate, time: parsedTime };
+    if (!pRef.current || data.length === 0) return;
 
-      try {
-        candlestickSeriesRef.current.update(parsedUpdate);
-        if (showVolume && volumeSeriesRef.current && liveUpdate.volume !== undefined) {
-          volumeSeriesRef.current.update({
-            time: parsedTime,
-            value: liveUpdate.volume,
-            color: 'rgba(0, 0, 0, 0.1)',
-          });
-        }
-      } catch (e) {
-        console.error("Error updating live data:", e);
-      }
-    }
-  }, [liveUpdate, showVolume]);
+    const sortedData = [...data].sort((a, b) => String(a.Date).localeCompare(String(b.Date)));
+    const times = sortedData.map(d => parseTime(d.Date));
+    const ohlc = sortedData.map((d, i) => ({ time: times[i], open: Number(d.Open), high: Number(d.High), low: Number(d.Low), close: Number(d.Close) })).filter(d => !isNaN(d.open));
 
-  useEffect(() => {
-    if (!chartContainerRef.current || data.length === 0) return;
-
-    const uniqueDataMap = new Map();
-    data.forEach(item => { if (item.Date) uniqueDataMap.set(item.Date, item); });
-    const sortedData = Array.from(uniqueDataMap.values()).sort((a, b) => a.Date.localeCompare(b.Date));
-
-    const ohlcData = sortedData
-      .filter(d => d.Open != null && d.High != null && d.Low != null && d.Close != null)
-      .map((d) => ({
-        time: parseTime(d.Date),
-        open: Number(d.Open),
-        high: Number(d.High),
-        low: Number(d.Low),
-        close: Number(d.Close),
-      }))
-      .filter(d => !isNaN(d.open) && !isNaN(d.high) && !isNaN(d.low) && !isNaN(d.close));
-
-    if (ohlcData.length === 0) return;
-    
-    // Sort array by time to prevent Lightweight Charts errors
-    ohlcData.sort((a, b) => (a.time as number) - (b.time as number));
-    
-    ohlcDataRef.current = ohlcData;
-
-    const chart = createChart(chartContainerRef.current, {
-      layout: {
-        background: { type: ColorType.Solid, color: '#D3D3D3' }, 
-        textColor: '#FFFFFF',
-      },
-      watermark: { visible: false },
+    const options = {
+      layout: { background: { type: ColorType.Solid, color: SOLAR_BASE3 }, textColor: SOLAR_BASE01 },
       grid: { vertLines: { visible: false }, horzLines: { visible: false } },
       crosshair: { mode: CrosshairMode.Normal },
-      rightPriceScale: { 
-        borderColor: '#AAAAAA', 
-        autoScale: true,
-        scaleMargins: { top: 0.1, bottom: 0.35 }, // Price restricted to top ~65%
-      },
-      leftPriceScale: { 
-        visible: false,
-        scaleMargins: { top: 0.8, bottom: 0 }, // Volume restricted to bottom 20%
-      },
-      timeScale: { borderColor: '#AAAAAA', timeVisible: true, rightOffset: 20, fixLeftEdge: false, fixRightEdge: false },
-      width: chartContainerRef.current.clientWidth,
-      height: chartContainerRef.current.clientHeight,
-    });
-    chartRef.current = chart;
+      timeScale: { borderColor: SOLAR_BASE1, timeVisible: true, rightOffset: 20, fixRightEdge: false },
+      handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: true },
+      handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
+    };
 
-    const candlestickSeries = chart.addCandlestickSeries({
-      upColor: 'transparent', downColor: '#FFFFFF', borderVisible: true,
-      borderUpColor: '#FFFFFF', borderDownColor: '#FFFFFF', wickUpColor: '#FFFFFF', wickDownColor: '#FFFFFF',
-    });
-    candlestickSeries.setData(ohlcData);
-    candlestickSeriesRef.current = candlestickSeries;
+    // Init All 5 Charts on persistent refs
+    const pc = createChart(pRef.current, options);
+    const vc = createChart(vRef.current!, options);
+    const bc = createChart(bRef.current!, options);
+    const boc = createChart(boRef.current!, options);
+    const cc = createChart(cRef.current!, options);
+    charts.current = { price: pc, volume: vc, breadth: bc, breakout: boc, correlation: cc };
 
-    if (showVolume) {
-      const volumeSeries = chart.addHistogramSeries({ 
-        color: 'rgba(0, 0, 0, 0.15)', 
-        priceFormat: { type: 'volume' },
-        priceScaleId: 'left', // Use the hidden left scale for the separate pane
-      });
-      const volData = sortedData.filter(d => d.Volume != null).map((d) => ({
-        time: parseTime(d.Date), value: Number(d.Volume), color: 'rgba(0, 0, 0, 0.1)',
-      })).filter(d => !isNaN(d.value));
-      volData.sort((a, b) => (a.time as number) - (b.time as number));
-      volumeSeries.setData(volData);
-      volumeSeriesRef.current = volumeSeries;
-    }
+    const candleS = pc.addCandlestickSeries({ upColor: 'transparent', downColor: SOLAR_BASE01, borderVisible: true, borderUpColor: SOLAR_BASE01, borderDownColor: SOLAR_BASE01, wickUpColor: SOLAR_BASE01, wickDownColor: SOLAR_BASE01 });
+    candleS.setData(ohlc);
 
     if (showPivots) {
-      // Discrete dots using setMarkers on transparent series
-      const resSeries = chart.addLineSeries({ color: 'transparent', lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false });
-      const supSeries = chart.addLineSeries({ color: 'transparent', lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false });
-
-      const resPoints: any[] = [];
-      const resMarkers: any[] = [];
-      const supPoints: any[] = [];
-      const supMarkers: any[] = [];
-
-      sortedData.forEach(d => {
+      const rs = pc.addLineSeries({ color: 'transparent', priceLineVisible: false, crosshairMarkerVisible: false });
+      const ss = pc.addLineSeries({ color: 'transparent', priceLineVisible: false, crosshairMarkerVisible: false });
+      const rp: any[] = [], sp: any[] = [], rm: any[] = [], sm: any[] = [];
+      sortedData.forEach((d, i) => {
         if (d.Resistance_Pivot != null && d.Is_Up_Rotation !== true) {
-          const val = Number(d.Resistance_Pivot);
-          if (!isNaN(val)) {
-            const time = parseTime(d.Date);
-            resPoints.push({ time, value: val });
-            resMarkers.push({ time, position: 'inBar', color: 'rgba(255, 50, 150, 0.5)', shape: 'circle', size: 0.1 });
-          }
+          rp.push({ time: times[i], value: Number(d.Resistance_Pivot) });
+          rm.push({ time: times[i], position: 'inBar', color: COLOR_PINK, shape: 'circle', size: 0.1 });
         }
         if (d.Support_Pivot != null && d.Is_Down_Rotation !== true) {
-          const val = Number(d.Support_Pivot);
-          if (!isNaN(val)) {
-            const time = parseTime(d.Date);
-            supPoints.push({ time, value: val });
-            supMarkers.push({ time, position: 'inBar', color: 'rgba(50, 50, 255, 0.5)', shape: 'circle', size: 0.1 });
-          }
+          sp.push({ time: times[i], value: Number(d.Support_Pivot) });
+          sm.push({ time: times[i], position: 'inBar', color: COLOR_BLUE, shape: 'circle', size: 0.1 });
         }
       });
-
-      if (resPoints.length > 0) { 
-        resPoints.sort((a, b) => (a.time as number) - (b.time as number));
-        resMarkers.sort((a, b) => (a.time as number) - (b.time as number));
-        resSeries.setData(resPoints); 
-        resSeries.setMarkers(resMarkers); 
-      }
-      if (supPoints.length > 0) { 
-        supPoints.sort((a, b) => (a.time as number) - (b.time as number));
-        supMarkers.sort((a, b) => (a.time as number) - (b.time as number));
-        supSeries.setData(supPoints); 
-        supSeries.setMarkers(supMarkers); 
-      }
+      rs.setData(rp); rs.setMarkers(rm);
+      ss.setData(sp); ss.setMarkers(sm);
     }
 
     if (showTargets) {
-      const createTargetSeries = (color: string) => chart.addLineSeries({
-        color, lineWidth: 2, lineType: LineType.WithSteps,
-        lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false,
-      });
-      const upperData = sortedData.filter(d => d.Upper_Target != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Upper_Target) })).filter(d => !isNaN(d.value));
-      const lowerData = sortedData.filter(d => d.Lower_Target != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Lower_Target) })).filter(d => !isNaN(d.value));
-      if (upperData.length > 0) {
-        upperData.sort((a, b) => (a.time as number) - (b.time as number));
-        createTargetSeries('#3232FF').setData(upperData);
-      }
-      if (lowerData.length > 0) {
-        lowerData.sort((a, b) => (a.time as number) - (b.time as number));
-        createTargetSeries('#FF3296').setData(lowerData);
-      }
+      const uT = sortedData.filter(d => d.Upper_Target != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Upper_Target) }));
+      const lT = sortedData.filter(d => d.Lower_Target != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Lower_Target) }));
+      if (uT.length) pc.addLineSeries({ color: COLOR_BLUE, lineWidth: 2, lineType: LineType.WithSteps, priceLineVisible: false }).setData(uT);
+      if (lT.length) pc.addLineSeries({ color: COLOR_PINK, lineWidth: 2, lineType: LineType.WithSteps, priceLineVisible: false }).setData(lT);
     }
 
-    setTimeout(() => { if (chartRef.current) applyRange(chartRef.current, ohlcData, rangeUpdateTrigger); }, 50);
-    const handleResize = () => { chart.applyOptions({ width: chartContainerRef.current?.clientWidth }); };
-    window.addEventListener('resize', handleResize);
-    return () => { window.removeEventListener('resize', handleResize); chart.remove(); chartRef.current = null; };
-  }, [data, showPivots, showTargets, showVolume]);
+    vc.addHistogramSeries({ color: 'rgba(147, 161, 161, 0.5)', priceFormat: { type: 'volume' } }).setData(sortedData.filter(d => d.Volume != null).map((d, i) => ({ time: times[i], value: Number(d.Volume) })));
+    bc.addLineSeries({ color: COLOR_BLUE, lineWidth: 2, title: 'Breadth %' }).setData(sortedData.filter(d => d.Uptrend_Pct != null).map((d, i) => ({ time: times[i], value: Number(d.Uptrend_Pct) * 100 })));
+    boc.addLineSeries({ color: COLOR_PINK, lineWidth: 2, title: 'Breakout %' }).setData(sortedData.filter(d => d.Breakout_Pct != null).map((d, i) => ({ time: times[i], value: Number(d.Breakout_Pct) * 100 })));
+    cc.addLineSeries({ color: SOLAR_BASE01, lineWidth: 2, title: 'Correlation %' }).setData(sortedData.filter(d => d.Correlation_Pct != null).map((d, i) => ({ time: times[i], value: Number(d.Correlation_Pct) * 100 })));
 
-  return <div ref={chartContainerRef} className="tv-chart-wrapper" />;
+    const list = [pc, vc, bc, boc, cc];
+    let syncing = false;
+    list.forEach(c => {
+      c.timeScale().subscribeVisibleLogicalRangeChange(r => { if (!syncing && r) { syncing = true; list.forEach(o => { if (o !== c) o.timeScale().setVisibleLogicalRange(r); }); syncing = false; } });
+      c.subscribeCrosshairMove(p => { if (!syncing) { syncing = true; list.forEach(o => { if (o !== c) { if (!p.time) o.clearCrosshairPosition(); else o.setCrosshairPosition(0 as any, p.time as any, null as any); } }); syncing = false; } });
+    });
+
+    pc.timeScale().setVisibleLogicalRange({ from: ohlc.length - 253, to: ohlc.length + 19 });
+
+    return () => list.forEach(c => c.remove());
+  }, [data, showPivots, showTargets]);
+
+  useEffect(() => {
+    const resize = () => {
+      Object.entries(charts.current).forEach(([id, chart]) => {
+        const ref: any = { price: pRef, volume: vRef, breadth: bRef, breakout: boRef, correlation: cRef }[id];
+        if (chart && ref.current) chart.applyOptions({ width: ref.current.clientWidth, height: ref.current.clientHeight });
+      });
+    };
+    resize();
+    window.addEventListener('resize', resize);
+    return () => window.removeEventListener('resize', resize);
+  }, [priceHeight, showVolume, showBreadth, showBreakout, showCorrelation]);
+
+  const activeCount = [showVolume, showBreadth, showBreakout, showCorrelation].filter(Boolean).length;
+  const indicatorFlex = activeCount > 0 ? (100 - priceHeight) / activeCount : 0;
+
+  return (
+    <div ref={containerRef} className="tv-chart-wrapper" style={{ display: 'flex', flexDirection: 'column' }}>
+      <div ref={pRef} style={{ flex: `0 0 ${activeCount > 0 ? priceHeight : 100}%`, minHeight: '100px' }} />
+      
+      <div className="pane-resizer" onMouseDown={() => { isDragging.current = true; }} style={{ display: activeCount > 0 ? 'block' : 'none', height: '6px', cursor: 'ns-resize', background: SOLAR_BASE1, flexShrink: 0 }} />
+      
+      <div ref={vRef} style={{ display: showVolume ? 'block' : 'none', flex: `0 0 ${indicatorFlex}%`, minHeight: '50px' }} />
+      <div ref={bRef} style={{ display: showBreadth ? 'block' : 'none', flex: `0 0 ${indicatorFlex}%`, minHeight: '50px', borderTop: showVolume ? `1px solid ${SOLAR_BASE1}` : 'none' }} />
+      <div ref={boRef} style={{ display: showBreakout ? 'block' : 'none', flex: `0 0 ${indicatorFlex}%`, minHeight: '50px', borderTop: (showVolume || showBreadth) ? `1px solid ${SOLAR_BASE1}` : 'none' }} />
+      <div ref={cRef} style={{ display: showCorrelation ? 'block' : 'none', flex: `0 0 ${indicatorFlex}%`, minHeight: '50px', borderTop: (showVolume || showBreadth || showBreakout) ? `1px solid ${SOLAR_BASE1}` : 'none' }} />
+    </div>
+  );
 };
