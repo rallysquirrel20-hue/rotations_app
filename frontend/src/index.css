@@ -304,6 +304,8 @@ html, body, #root {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  display: flex;
+  flex-direction: column;
 }
 
 .summary-tabs {
@@ -336,22 +338,74 @@ html, body, #root {
   overflow-x: auto;
 }
 
-/* Correlation tab — horizontal scroll for wide heatmap */
-.corr-scroll {
-  overflow-x: auto;
-}
-
-/* Returns tab — canvas chart fills available space */
-.returns-container {
+/* Correlation tab — fit heatmap to available space */
+.corr-wrapper {
   flex: 1;
   display: flex;
   flex-direction: column;
   min-height: 0;
+  align-items: center;
+  justify-content: center;
+}
+
+.corr-scroll {
+  overflow: auto;
+  max-width: 100%;
+  max-height: 100%;
+}
+
+.corr-row-label, .corr-header-text {
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.corr-legend {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+  font-size: 10px;
+}
+
+/* Returns tab — legend column on left, chart fills remaining space */
+.returns-container {
+  flex: 1;
+  display: flex;
+  flex-direction: row;
+  min-height: 0;
+}
+
+.returns-legend-left {
+  width: 120px;
+  min-width: 120px;
+  overflow-y: auto;
+  padding: 4px 0;
+  border-right: 1px solid var(--border-color);
+  font-size: 11px;
+  font-family: var(--font-mono, monospace);
+}
+
+.returns-legend-item {
+  padding: 2px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  font-weight: bold;
+}
+
+.returns-legend-item:hover,
+.returns-legend-item.highlighted {
+  background: var(--bg-sidebar);
+}
+
+.returns-legend-val {
+  font-weight: normal;
+  opacity: 0.7;
 }
 
 .returns-chart {
   flex: 1;
   min-height: 0;
+  min-width: 0;
 }
 
 .summary-th {

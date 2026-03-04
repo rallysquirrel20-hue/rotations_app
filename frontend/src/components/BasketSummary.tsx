@@ -3,14 +3,22 @@ import { useState, useMemo, useRef, useEffect } from 'react'
 interface OpenSignal {
   Ticker: string
   Signal_Type: string
+  Entry_Date: string | null
   Close: number | null
-  Current_Performance: number | null
   Entry_Price: number | null
+  Current_Performance: number | null
   Win_Rate: number | null
-  Historical_EV: number | null
-  Risk_Adj_EV: number | null
   Avg_Winner: number | null
   Avg_Loser: number | null
+  Avg_Winner_Bars: number | null
+  Avg_Loser_Bars: number | null
+  Avg_MFE: number | null
+  Avg_MAE: number | null
+  Std_Dev: number | null
+  Historical_EV: number | null
+  EV_Last_3: number | null
+  Risk_Adj_EV: number | null
+  Risk_Adj_EV_Last_3: number | null
   Count: number
 }
 
@@ -34,7 +42,13 @@ interface BasketSummaryProps {
 }
 
 type SortKey = keyof OpenSignal
-type TabType = 'signals' | 'correlation' | 'returns'
+type TabType = 'breakout' | 'rotation' | 'btfd' | 'correlation' | 'returns'
+
+const SIGNAL_FILTERS: Record<'breakout' | 'rotation' | 'btfd', string[]> = {
+  breakout: ['Breakout', 'Breakdown'],
+  rotation: ['Up_Rot', 'Down_Rot'],
+  btfd: ['BTFD', 'STFR'],
+}
 type CellValue = string | number | null
 
 const COLORS = [
@@ -70,15 +84,14 @@ function dollarFmtCell(v: CellValue): string {
 }
 
 function corrColor(v: number | null): string {
-  if (v === null) return '#f8f9fa'
-  // Blue for positive, red for negative, white at 0
+  if (v === null) return '#fdf6e3'
+  // Blue (50,50,255) for positive, pink (255,50,150) for negative, white at 0
   const clamped = Math.max(-1, Math.min(1, v))
+  const t = Math.abs(clamped)
   if (clamped >= 0) {
-    const intensity = Math.round(clamped * 200)
-    return `rgb(${255 - intensity}, ${255 - intensity * 0.3}, 255)`
+    return `rgb(${Math.round(255 - t * 205)}, ${Math.round(255 - t * 205)}, 255)`
   } else {
-    const intensity = Math.round(-clamped * 200)
-    return `rgb(255, ${255 - intensity * 0.5}, ${255 - intensity})`
+    return `rgb(255, ${Math.round(255 - t * 205)}, ${Math.round(255 - t * 105)})`
   }
 }
 
@@ -105,16 +118,24 @@ function SignalsTable({ signals }: { signals: OpenSignal[] }) {
 
   const columns: { key: SortKey; label: string; fmt?: (v: CellValue) => string; color?: (v: CellValue) => string }[] = [
     { key: 'Ticker', label: 'Ticker' },
-    { key: 'Signal_Type', label: 'Signal Type' },
+    { key: 'Signal_Type', label: 'Signal' },
+    { key: 'Entry_Date', label: 'Entry Date' },
     { key: 'Close', label: 'Close', fmt: dollarFmtCell },
-    { key: 'Current_Performance', label: 'Current Perf', fmt: pctFmtCell, color: colorForPerfCell },
-    { key: 'Entry_Price', label: 'Entry Price', fmt: dollarFmtCell },
-    { key: 'Win_Rate', label: 'Win Rate', fmt: pctFmtCell },
-    { key: 'Historical_EV', label: 'Hist EV', fmt: pctFmtCell, color: colorForPerfCell },
-    { key: 'Risk_Adj_EV', label: 'Risk Adj EV', fmt: pctFmtCell, color: colorForPerfCell },
-    { key: 'Avg_Winner', label: 'Avg Winner', fmt: pctFmtCell },
-    { key: 'Avg_Loser', label: 'Avg Loser', fmt: pctFmtCell },
-    { key: 'Count', label: 'Count' },
+    { key: 'Entry_Price', label: 'Entry', fmt: dollarFmtCell },
+    { key: 'Current_Performance', label: 'Perf', fmt: pctFmtCell, color: colorForPerfCell },
+    { key: 'Win_Rate', label: 'Win%', fmt: pctFmtCell },
+    { key: 'Avg_Winner', label: 'Avg W', fmt: pctFmtCell },
+    { key: 'Avg_Loser', label: 'Avg L', fmt: pctFmtCell },
+    { key: 'Avg_Winner_Bars', label: 'W Bars' },
+    { key: 'Avg_Loser_Bars', label: 'L Bars' },
+    { key: 'Avg_MFE', label: 'MFE', fmt: pctFmtCell },
+    { key: 'Avg_MAE', label: 'MAE', fmt: pctFmtCell },
+    { key: 'Historical_EV', label: 'EV', fmt: pctFmtCell, color: colorForPerfCell },
+    { key: 'EV_Last_3', label: 'EV L3', fmt: pctFmtCell, color: colorForPerfCell },
+    { key: 'Risk_Adj_EV', label: 'R/A EV', fmt: pctFmtCell, color: colorForPerfCell },
+    { key: 'Risk_Adj_EV_Last_3', label: 'R/A L3', fmt: pctFmtCell, color: colorForPerfCell },
+    { key: 'Std_Dev', label: 'StdDev', fmt: pctFmtCell },
+    { key: 'Count', label: 'Cnt' },
   ]
 
   return (
@@ -153,12 +174,32 @@ function SignalsTable({ signals }: { signals: OpenSignal[] }) {
 
 function CorrelationHeatmap({ data }: { data: CorrelationData }) {
   const { labels, matrix } = data
+  const containerRef = useRef<HTMLDivElement>(null)
+  const [dims, setDims] = useState({ w: 600, h: 400 })
+
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const obs = new ResizeObserver(entries => {
+      const { width, height } = entries[0].contentRect
+      if (width > 0 && height > 0) setDims({ w: width, h: height })
+    })
+    obs.observe(el)
+    return () => obs.disconnect()
+  }, [])
+
   if (!labels.length) return <div className="summary-empty">No correlation data</div>
 
-  const cellSize = Math.max(20, Math.min(40, 600 / labels.length))
+  // Reserve space for row labels and header labels
+  const labelMargin = 60
+  const legendHeight = 24
+  const availW = dims.w - labelMargin
+  const availH = dims.h - labelMargin - legendHeight
+  const cellSize = Math.max(8, Math.min(40, Math.floor(Math.min(availW, availH) / labels.length)))
+  const showValues = cellSize >= 28
 
   return (
-    <div className="corr-wrapper">
+    <div className="corr-wrapper" ref={containerRef}>
       <div className="corr-scroll">
         <table className="corr-table" style={{ borderCollapse: 'collapse' }}>
           <thead>
@@ -177,9 +218,9 @@ function CorrelationHeatmap({ data }: { data: CorrelationData }) {
                 <td className="corr-row-label">{rowLabel}</td>
                 {(matrix[ri] || []).map((val, ci) => (
                   <td key={ci} className="corr-cell"
-                      style={{ backgroundColor: corrColor(val), width: cellSize, height: cellSize }}
+                      style={{ backgroundColor: corrColor(val), width: cellSize, height: cellSize, fontSize: Math.max(8, cellSize * 0.35) }}
                       title={`${rowLabel} / ${labels[ci]}: ${val !== null ? val.toFixed(3) : 'N/A'}`}>
-                    {labels.length <= 15 && val !== null ? val.toFixed(2) : ''}
+                    {showValues && val !== null ? val.toFixed(2) : ''}
                   </td>
                 ))}
               </tr>
@@ -188,9 +229,9 @@ function CorrelationHeatmap({ data }: { data: CorrelationData }) {
         </table>
       </div>
       <div className="corr-legend">
-        <span style={{ color: '#dc2626' }}>-1.0</span>
+        <span style={{ color: 'rgb(255, 50, 150)' }}>-1.0</span>
         <div className="corr-gradient"></div>
-        <span style={{ color: '#2962ff' }}>+1.0</span>
+        <span style={{ color: 'rgb(50, 50, 255)' }}>+1.0</span>
       </div>
     </div>
   )
@@ -201,6 +242,19 @@ function ReturnsChart({ data }: { data: CumulativeReturnsData }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [hoveredTicker, setHoveredTicker] = useState<string | null>(null)
   const [dims, setDims] = useState({ w: 800, h: 400 })
+
+  // Sort series by latest return value, highest to lowest
+  const sortedSeries = useMemo(() => {
+    const withLatest = data.series.map((s, origIndex) => {
+      let lastVal = 0
+      for (let i = s.values.length - 1; i >= 0; i--) {
+        if (s.values[i] !== null) { lastVal = s.values[i]!; break }
+      }
+      return { ...s, origIndex, lastVal }
+    })
+    withLatest.sort((a, b) => b.lastVal - a.lastVal)
+    return withLatest
+  }, [data.series])
 
   useEffect(() => {
     const el = containerRef.current
@@ -240,7 +294,7 @@ function ReturnsChart({ data }: { data: CumulativeReturnsData }) {
     const yScale = (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
 
     ctx.clearRect(0, 0, dims.w, dims.h)
-    ctx.fillStyle = '#ffffff'
+    ctx.fillStyle = '#fdf6e3'
     ctx.fillRect(0, 0, dims.w, dims.h)
 
     // Grid
@@ -269,11 +323,11 @@ function ReturnsChart({ data }: { data: CumulativeReturnsData }) {
       ctx.fillText(data.dates[i].slice(0, 7), x, dims.h - pad.bottom + 15)
     }
 
-    // Draw lines
-    data.series.forEach((s, si) => {
+    // Draw lines (use origIndex for consistent color mapping)
+    sortedSeries.forEach(s => {
       const isHovered = hoveredTicker === s.ticker
       const isOther = hoveredTicker !== null && !isHovered
-      ctx.strokeStyle = isOther ? '#dee2e6' : COLORS[si % COLORS.length]
+      ctx.strokeStyle = isOther ? '#dee2e6' : COLORS[s.origIndex % COLORS.length]
       ctx.lineWidth = isHovered ? 2.5 : 1.2
       ctx.globalAlpha = isOther ? 0.3 : 1
       ctx.beginPath()
@@ -287,38 +341,52 @@ function ReturnsChart({ data }: { data: CumulativeReturnsData }) {
       ctx.stroke()
       ctx.globalAlpha = 1
     })
-  }, [data, dims, hoveredTicker])
+  }, [data, dims, hoveredTicker, sortedSeries])
 
   return (
     <div className="returns-container">
+      <div className="returns-legend-left">
+        {sortedSeries.map(s => (
+          <div key={s.ticker}
+               className={`returns-legend-item ${hoveredTicker === s.ticker ? 'highlighted' : ''}`}
+               style={{ color: COLORS[s.origIndex % COLORS.length] }}
+               onMouseEnter={() => setHoveredTicker(s.ticker)}
+               onMouseLeave={() => setHoveredTicker(null)}>
+            {s.ticker} <span className="returns-legend-val">{(s.lastVal * 100).toFixed(1)}%</span>
+          </div>
+        ))}
+      </div>
       <div className="returns-chart" ref={containerRef}>
         <canvas ref={canvasRef} style={{ width: '100%', height: '100%' }} />
-      </div>
-      <div className="returns-legend">
-        {data.series.map((s, i) => (
-          <span key={s.ticker} className={`returns-legend-item ${hoveredTicker === s.ticker ? 'highlighted' : ''}`}
-                style={{ color: COLORS[i % COLORS.length] }}
-                onMouseEnter={() => setHoveredTicker(s.ticker)}
-                onMouseLeave={() => setHoveredTicker(null)}>
-            {s.ticker}
-          </span>
-        ))}
       </div>
     </div>
   )
 }
 
 export function BasketSummary({ data, loading }: BasketSummaryProps) {
-  const [tab, setTab] = useState<TabType>('signals')
+  const [tab, setTab] = useState<TabType>('breakout')
 
   if (loading) return <div className="summary-panel"><div className="summary-loading">Loading summary...</div></div>
   if (!data) return <div className="summary-panel"><div className="summary-empty">No summary data</div></div>
 
+  const filterSignals = (key: 'breakout' | 'rotation' | 'btfd') =>
+    data.open_signals.filter(s => SIGNAL_FILTERS[key].includes(s.Signal_Type))
+
+  const breakoutSignals = filterSignals('breakout')
+  const rotationSignals = filterSignals('rotation')
+  const btfdSignals = filterSignals('btfd')
+
   return (
     <div className="summary-panel">
       <div className="summary-tabs">
-        <button className={`summary-tab ${tab === 'signals' ? 'active' : ''}`} onClick={() => setTab('signals')}>
-          Signals ({data.open_signals.length})
+        <button className={`summary-tab ${tab === 'breakout' ? 'active' : ''}`} onClick={() => setTab('breakout')}>
+          BO/BD ({breakoutSignals.length})
+        </button>
+        <button className={`summary-tab ${tab === 'rotation' ? 'active' : ''}`} onClick={() => setTab('rotation')}>
+          Rot ({rotationSignals.length})
+        </button>
+        <button className={`summary-tab ${tab === 'btfd' ? 'active' : ''}`} onClick={() => setTab('btfd')}>
+          BTFD/STFR ({btfdSignals.length})
         </button>
         <button className={`summary-tab ${tab === 'correlation' ? 'active' : ''}`} onClick={() => setTab('correlation')}>
           Correlation
@@ -328,7 +396,9 @@ export function BasketSummary({ data, loading }: BasketSummaryProps) {
         </button>
       </div>
       <div className="summary-content">
-        {tab === 'signals' && <SignalsTable signals={data.open_signals} />}
+        {tab === 'breakout' && <SignalsTable signals={breakoutSignals} />}
+        {tab === 'rotation' && <SignalsTable signals={rotationSignals} />}
+        {tab === 'btfd' && <SignalsTable signals={btfdSignals} />}
         {tab === 'correlation' && <CorrelationHeatmap data={data.correlation} />}
         {tab === 'returns' && <ReturnsChart data={data.cumulative_returns} />}
       </div>

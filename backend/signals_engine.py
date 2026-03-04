@@ -19,7 +19,7 @@ RV_EMA_ALPHA = 2.0 / 11.0
 
 ET = ZoneInfo("America/New_York")
 BASE_OUTPUT_FOLDER = Path(os.getenv("PYTHON_OUTPUTS_DIR", Path.home() / "Documents" / "Python_Outputs"))
-PICKLE_FOLDER = BASE_OUTPUT_FOLDER / "Pickle_Files"
+PICKLE_FOLDER = BASE_OUTPUT_FOLDER / "data_storage"
 PICKLE_FOLDER.mkdir(parents=True, exist_ok=True)
 
 UNIVERSE_PICKLE_PATH = Path(os.getenv("UNIVERSE_PICKLE_PATH", PICKLE_FOLDER / f"top{SIZE}stocks.pkl"))

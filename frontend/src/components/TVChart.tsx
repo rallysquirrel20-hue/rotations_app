@@ -144,10 +144,12 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     dataLengthRef.current = ohlc.length;
     timesRef.current = times;
 
+    const PRICE_SCALE_WIDTH = 70;
     const chartOptions = {
       layout: { background: { type: ColorType.Solid, color: SOLAR_BASE3 }, textColor: SOLAR_BASE01 },
       grid: { vertLines: { visible: false }, horzLines: { visible: false } },
       crosshair: { mode: CrosshairMode.Normal },
+      rightPriceScale: { minimumWidth: PRICE_SCALE_WIDTH },
       timeScale: { borderColor: SOLAR_BASE1, timeVisible: true, rightOffset: 20, fixRightEdge: false },
       handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: true },
       handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
@@ -191,8 +193,8 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     if (showTargets) {
       const uT = sortedData.filter(d => d.Upper_Target != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Upper_Target) }));
       const lT = sortedData.filter(d => d.Lower_Target != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Lower_Target) }));
-      if (uT.length) pc.addLineSeries({ color: COLOR_BLUE, lineWidth: 2, lineType: LineType.WithSteps, priceLineVisible: false }).setData(uT);
-      if (lT.length) pc.addLineSeries({ color: COLOR_PINK, lineWidth: 2, lineType: LineType.WithSteps, priceLineVisible: false }).setData(lT);
+      if (uT.length) pc.addLineSeries({ color: COLOR_BLUE, lineWidth: 2, lineType: LineType.WithSteps, priceLineVisible: false, crosshairMarkerVisible: false }).setData(uT);
+      if (lT.length) pc.addLineSeries({ color: COLOR_PINK, lineWidth: 2, lineType: LineType.WithSteps, priceLineVisible: false, crosshairMarkerVisible: false }).setData(lT);
     }
 
     // Indicator panes — same pattern as volume for all
@@ -221,6 +223,29 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
       ic.priceScale('__align__').applyOptions({ visible: false });
     });
 
+    // Build time→value lookup maps for crosshair sync
+    const seriesDataMaps: Record<string, Map<any, number>> = {};
+    // Price: use close
+    const priceMap = new Map<any, number>();
+    ohlc.forEach(d => priceMap.set(d.time, d.close));
+    seriesDataMaps['price'] = priceMap;
+    // Volume
+    const volMap = new Map<any, number>();
+    sortedData.forEach((d, i) => { if (d.Volume != null) volMap.set(times[i], Number(d.Volume)); });
+    seriesDataMaps['volume'] = volMap;
+    // Breadth
+    const breadthMap = new Map<any, number>();
+    sortedData.forEach((d, i) => { if (d.Uptrend_Pct != null) breadthMap.set(times[i], Number(d.Uptrend_Pct)); });
+    seriesDataMaps['breadth'] = breadthMap;
+    // Breakout
+    const breakoutMap = new Map<any, number>();
+    sortedData.forEach((d, i) => { if (d.Breakout_Pct != null) breakoutMap.set(times[i], Number(d.Breakout_Pct)); });
+    seriesDataMaps['breakout'] = breakoutMap;
+    // Correlation
+    const corrMap = new Map<any, number>();
+    sortedData.forEach((d, i) => { if (d.Correlation_Pct != null) corrMap.set(times[i], Number(d.Correlation_Pct) * 100); });
+    seriesDataMaps['correlation'] = corrMap;
+
     // Sync time scales and crosshairs across all charts
     const chartEntries: [string, IChartApi][] = [
       ['price', pc], ['volume', vc], ['breadth', bc], ['breakout', boc], ['correlation', cc],
@@ -239,8 +264,16 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
         crosshairSyncing = true;
         chartEntries.forEach(([otherId, target]) => {
           if (target !== source) {
-            if (!p.time) target.clearCrosshairPosition();
-            else target.setCrosshairPosition(0 as any, p.time as any, seriesRefs.current[otherId]!);
+            const s = seriesRefs.current[otherId];
+            if (!s) return;
+            if (!p.time) {
+              target.clearCrosshairPosition();
+            } else {
+              const val = seriesDataMaps[otherId]?.get(p.time);
+              if (val !== undefined) {
+                target.setCrosshairPosition(val, p.time as any, s);
+              }
+            }
           }
         });
         crosshairSyncing = false;
