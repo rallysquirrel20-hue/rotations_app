@@ -51,21 +51,35 @@ app.add_middleware(
 DEFAULT_PATH = Path.home() / "Documents" / "Python_Outputs"
 BASE_DIR = Path(os.getenv("PYTHON_OUTPUTS_DIR", str(DEFAULT_PATH)))
 
-BASKET_EQUITY_CACHE = BASE_DIR / "Pickle_Files" / "basket_equity_cache"
-BASKET_SIGNALS_CACHE = BASE_DIR / "Pickle_Files" / "basket_signals_cache"
-INDIVIDUAL_SIGNALS_FILE = BASE_DIR / "Pickle_Files" / "signals_cache_500.parquet"
-TOP_500_FILE = BASE_DIR / "Pickle_Files" / "top500stocks.pkl"
-GICS_MAPPINGS_FILE = BASE_DIR / "Pickle_Files" / "gics_mappings_500.pkl"
+BASKET_EQUITY_CACHE = BASE_DIR / "data_storage" / "basket_equity_cache"
+BASKET_SIGNALS_CACHE = BASE_DIR / "data_storage" / "basket_signals_cache"
+INDIVIDUAL_SIGNALS_FILE = BASE_DIR / "data_storage" / "signals_cache_500.parquet"
+TOP_500_FILE = BASE_DIR / "data_storage" / "top500stocks.json"
+GICS_MAPPINGS_FILE = BASE_DIR / "data_storage" / "gics_mappings_500.json"
+LIVE_OHLC_FILE = BASE_DIR / "data_storage" / "live_ohlc_today.parquet"
+LIVE_BASKET_OHLC_FILE = BASE_DIR / "data_storage" / "live_basket_ohlc_today.parquet"
 
 THEMATIC_CONFIG = {
-    "High_Beta": ("beta_universes_500.pkl", 0),
-    "Low_Beta": ("beta_universes_500.pkl", 1),
-    "Momentum_Leaders": ("momentum_universes_500.pkl", 0),
-    "Momentum_Losers": ("momentum_universes_500.pkl", 1),
-    "High_Dividend_Yield": ("dividend_universes_500.pkl", 0),
-    "Dividend_Growth": ("dividend_universes_500.pkl", 1),
-    "Risk_Adj_Momentum": ("risk_adj_momentum_500.pkl", None),
+    "High_Beta": ("beta_universes_500.json", "high"),
+    "Low_Beta": ("beta_universes_500.json", "low"),
+    "Momentum_Leaders": ("momentum_universes_500.json", "winners"),
+    "Momentum_Losers": ("momentum_universes_500.json", "losers"),
+    "High_Dividend_Yield": ("dividend_universes_500.json", "high_yield"),
+    "Dividend_Growth": ("dividend_universes_500.json", "div_growth"),
+    "Risk_Adj_Momentum": ("risk_adj_momentum_500.json", None),
 }
+
+def _read_live_parquet(path):
+    """Read a live parquet file. Returns None if missing, empty, or contains empty dict."""
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_parquet(path)
+        if df.empty:
+            return None
+        return df
+    except Exception:
+        return None
 
 _DV_DATA = None
 
@@ -89,20 +103,23 @@ def clean_data_for_json(df):
 
 def get_latest_universe_tickers(basket_name):
     if GICS_MAPPINGS_FILE.exists():
-        with open(GICS_MAPPINGS_FILE, 'rb') as f:
-            gics = pickle.load(f)
+        with open(GICS_MAPPINGS_FILE, 'r') as f:
+            gics = json.load(f)
             search_name = basket_name.replace("_", " ")
-            if search_name in gics:
-                d = gics[search_name]
-                qs = sorted(d.keys())
-                if qs: return list(d[qs[-1]])
+            # Search in sector_u and industry_u sub-dicts
+            for group_key in ('sector_u', 'industry_u'):
+                group = gics.get(group_key, {})
+                if search_name in group:
+                    d = group[search_name]
+                    qs = sorted(d.keys())
+                    if qs: return list(d[qs[-1]])
     if basket_name in THEMATIC_CONFIG:
-        fn, idx = THEMATIC_CONFIG[basket_name]
-        p_path = BASE_DIR / "Pickle_Files" / fn
+        fn, key = THEMATIC_CONFIG[basket_name]
+        p_path = BASE_DIR / "data_storage" / fn
         if p_path.exists():
-            with open(p_path, 'rb') as f:
-                data = pickle.load(f)
-                ud = data[idx] if idx is not None else data
+            with open(p_path, 'r') as f:
+                data = json.load(f)
+                ud = data[key] if key is not None else data
                 qs = sorted(ud.keys())
                 if qs: return list(ud[qs[-1]])
     return []
@@ -220,7 +237,7 @@ def list_baskets():
     for k in cats: cats[k].sort()
     return cats
 
-CORRELATION_FILE = BASE_DIR / "Pickle_Files" / "correlation_cache" / "within_osc_500.parquet"
+CORRELATION_FILE = BASE_DIR / "data_storage" / "correlation_cache" / "within_osc_500.parquet"
 
 logger.info(f"BASE_DIR: {BASE_DIR} (exists={BASE_DIR.exists()})")
 logger.info(f"BASKET_SIGNALS_CACHE: {BASKET_SIGNALS_CACHE} (exists={BASKET_SIGNALS_CACHE.exists()})")
@@ -265,14 +282,25 @@ def get_basket_data(basket_name: str):
     if not ohlc_file.exists(): raise HTTPException(status_code=404)
     try:
         df_ohlc = pd.read_parquet(ohlc_file)
+        df_ohlc['Date'] = pd.to_datetime(df_ohlc['Date'])
+
+        # Merge live basket data for today's candle
+        live_basket_df = _read_live_parquet(LIVE_BASKET_OHLC_FILE)
+        if live_basket_df is not None:
+            live_row = live_basket_df[live_basket_df['Basket'] == basket_name]
+            if not live_row.empty:
+                live_row = live_row.copy()
+                live_row['Date'] = pd.to_datetime(live_row['Date'])
+                live_row = live_row.drop(columns=['Basket'])
+                df_ohlc = pd.concat([df_ohlc, live_row], ignore_index=True)
+                df_ohlc = df_ohlc.drop_duplicates(subset=['Date'], keep='last')
+
         if signals_file.exists():
             df_s = pd.read_parquet(signals_file)
-            df_ohlc['Date'] = pd.to_datetime(df_ohlc['Date'])
             df_s['Date'] = pd.to_datetime(df_s['Date'])
             df = pd.merge(df_ohlc, df_s.drop(columns=[c for c in ['Open','High','Low','Close','Volume'] if c in df_s.columns]), on='Date', how='left')
         else:
             df = df_ohlc
-            df['Date'] = pd.to_datetime(df['Date'])
 
         # LOAD PRE-CALCULATED CORRELATION
         corr_df = get_basket_correlation(basket_name)
@@ -297,8 +325,8 @@ def get_basket_data(basket_name: str):
 def list_tickers():
     if TOP_500_FILE.exists():
         try:
-            with open(TOP_500_FILE, 'rb') as f:
-                data = pickle.load(f)
+            with open(TOP_500_FILE, 'r') as f:
+                data = json.load(f)
                 qs = sorted(data.keys())
                 if qs: return sorted(list(data[qs[-1]]))
         except: pass
@@ -314,32 +342,17 @@ def get_ticker_data(ticker: str):
     try:
         df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, filters=[('Ticker', '==', ticker)])
         if 'Date' in df.columns: df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
-        
-        # Merge with live data if client is available
-        if db_client:
-            try:
-                # Fetch today's data from Databento (ohlcv-1d)
-                # We use today's date and a large enough lookback to ensure we catch the current bar
-                start = datetime.now().strftime("%Y-%m-%d")
-                live_data = db_client.timeseries.get_range(
-                    dataset=DB_DATASET,
-                    symbols=ticker,
-                    schema="ohlcv-1d",
-                    start=start,
-                    stype_in=DB_STYPE_IN
-                )
-                if not live_data.empty:
-                    live_df = live_data.to_df()
-                    live_df['Date'] = live_df.index.strftime('%Y-%m-%d')
-                    # Rename columns to match local schema
-                    live_df = live_df.rename(columns={
-                        'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'
-                    })
-                    # Combine and drop duplicates (preferring live data for today)
-                    df = pd.concat([df, live_df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]])
-                    df = df.drop_duplicates(subset=['Date'], keep='last')
-            except Exception as live_e:
-                print(f"Error fetching live daily data for {ticker}: {live_e}")
+
+        # Merge live data from parquet for today's candle
+        live_df = _read_live_parquet(LIVE_OHLC_FILE)
+        if live_df is not None:
+            live_row = live_df[live_df['Ticker'] == ticker]
+            if not live_row.empty:
+                live_row = live_row.copy()
+                live_row['Date'] = pd.to_datetime(live_row['Date']).dt.strftime('%Y-%m-%d')
+                live_row = live_row.drop(columns=['Ticker'])
+                df = pd.concat([df, live_row[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]], ignore_index=True)
+                df = df.drop_duplicates(subset=['Date'], keep='last')
 
         return {"chart_data": clean_data_for_json(df.sort_values('Date')), "tickers": []}
     except: raise HTTPException(status_code=500)
@@ -410,6 +423,13 @@ def get_intraday_data(ticker: str, response: Response, interval: str = "1m"):
         raise HTTPException(status_code=500, detail=str(e))
 
 SIGNAL_TYPES = ['Breakout', 'Breakdown', 'Up_Rot', 'Down_Rot', 'BTFD', 'STFR']
+SIGNAL_PAIRS = [('Breakout', 'Breakdown'), ('Up_Rot', 'Down_Rot'), ('BTFD', 'STFR')]
+# The Is_ columns in the parquet use different names for rotations
+SIGNAL_IS_COL = {
+    'Breakout': 'Is_Breakout', 'Breakdown': 'Is_Breakdown',
+    'Up_Rot': 'Is_Up_Rotation', 'Down_Rot': 'Is_Down_Rotation',
+    'BTFD': 'Is_BTFD', 'STFR': 'Is_STFR',
+}
 
 
 def safe_float(value, digits=4):
@@ -435,46 +455,82 @@ def get_basket_summary(basket_name: str):
             raise HTTPException(status_code=404, detail="No tickers found for basket")
 
         # --- Open Signals ---
+        STAT_SUFFIXES = [
+            'Entry_Price', 'Exit_Date',
+            'Win_Rate', 'Avg_Winner', 'Avg_Loser', 'Avg_Winner_Bars', 'Avg_Loser_Bars',
+            'Avg_MFE', 'Avg_MAE',
+            'Std_Dev', 'Historical_EV', 'EV_Last_3',
+            'Risk_Adj_EV', 'Risk_Adj_EV_Last_3', 'Count',
+        ]
         cols_needed = ['Ticker', 'Date', 'Close']
         for st in SIGNAL_TYPES:
-            cols_needed.extend([
-                f'{st}_Entry_Price', f'{st}_Exit_Date', f'{st}_Win_Rate',
-                f'{st}_Historical_EV', f'{st}_Risk_Adj_EV',
-                f'{st}_Avg_Winner', f'{st}_Avg_Loser', f'{st}_Count',
-            ])
+            cols_needed.append(SIGNAL_IS_COL[st])
+            for suf in STAT_SUFFIXES:
+                cols_needed.append(f'{st}_{suf}')
         df = pd.read_parquet(
             INDIVIDUAL_SIGNALS_FILE,
             columns=cols_needed,
             filters=[('Ticker', 'in', tickers)],
         )
-        latest = df.sort_values('Date').groupby('Ticker').tail(1)
+        df = df.sort_values('Date')
+
+        # For each ticker and signal pair, find which signal fired most recently
+        # so we only report one open signal per pair per ticker.
+        SHORT_SIGNALS = {'Down_Rot', 'Breakdown', 'STFR'}
+        last_fired = {}  # (ticker, pair_index) -> (signal_type, entry_date)
+        for _, row in df.iterrows():
+            ticker = row['Ticker']
+            row_date = row['Date']
+            for pi, (s1, s2) in enumerate(SIGNAL_PAIRS):
+                if row.get(SIGNAL_IS_COL[s1], False):
+                    last_fired[(ticker, pi)] = (s1, row_date)
+                if row.get(SIGNAL_IS_COL[s2], False):
+                    last_fired[(ticker, pi)] = (s2, row_date)
+
+        latest = df.groupby('Ticker').tail(1)
 
         open_signals = []
         for _, row in latest.iterrows():
             ticker = row['Ticker']
-            close = row['Close']
-            for st in SIGNAL_TYPES:
-                entry_col = f'{st}_Entry_Price'
-                exit_col = f'{st}_Exit_Date'
+            for pi, (s1, s2) in enumerate(SIGNAL_PAIRS):
+                fired = last_fired.get((ticker, pi))
+                if fired is None:
+                    continue
+                active, entry_date = fired
+                entry_col = f'{active}_Entry_Price'
+                exit_col = f'{active}_Exit_Date'
                 if entry_col not in row.index:
                     continue
                 entry_price = row.get(entry_col)
                 exit_date = row.get(exit_col)
                 if pd.isna(entry_price) or pd.notna(exit_date):
                     continue
-                perf = (close / entry_price - 1) if entry_price else 0
+                close = row['Close']
+                if active in SHORT_SIGNALS:
+                    perf = (entry_price - close) / entry_price if entry_price else 0
+                else:
+                    perf = (close - entry_price) / entry_price if entry_price else 0
+                entry_date_str = pd.Timestamp(entry_date).strftime('%Y-%m-%d') if pd.notna(entry_date) else None
                 open_signals.append({
                     'Ticker': ticker,
-                    'Signal_Type': st.replace('_', ' ') if st in ('Up_Rot', 'Down_Rot') else st,
+                    'Signal_Type': active,
+                    'Entry_Date': entry_date_str,
                     'Close': safe_float(close, 2),
-                    'Current_Performance': safe_float(perf, 4),
                     'Entry_Price': safe_float(entry_price, 2),
-                    'Win_Rate': safe_float(row.get(f'{st}_Win_Rate')),
-                    'Historical_EV': safe_float(row.get(f'{st}_Historical_EV')),
-                    'Risk_Adj_EV': safe_float(row.get(f'{st}_Risk_Adj_EV')),
-                    'Avg_Winner': safe_float(row.get(f'{st}_Avg_Winner')),
-                    'Avg_Loser': safe_float(row.get(f'{st}_Avg_Loser')),
-                    'Count': safe_int(row.get(f'{st}_Count')),
+                    'Current_Performance': safe_float(perf, 4),
+                    'Win_Rate': safe_float(row.get(f'{active}_Win_Rate')),
+                    'Avg_Winner': safe_float(row.get(f'{active}_Avg_Winner')),
+                    'Avg_Loser': safe_float(row.get(f'{active}_Avg_Loser')),
+                    'Avg_Winner_Bars': safe_float(row.get(f'{active}_Avg_Winner_Bars'), 1),
+                    'Avg_Loser_Bars': safe_float(row.get(f'{active}_Avg_Loser_Bars'), 1),
+                    'Avg_MFE': safe_float(row.get(f'{active}_Avg_MFE')),
+                    'Avg_MAE': safe_float(row.get(f'{active}_Avg_MAE')),
+                    'Std_Dev': safe_float(row.get(f'{active}_Std_Dev')),
+                    'Historical_EV': safe_float(row.get(f'{active}_Historical_EV')),
+                    'EV_Last_3': safe_float(row.get(f'{active}_EV_Last_3')),
+                    'Risk_Adj_EV': safe_float(row.get(f'{active}_Risk_Adj_EV')),
+                    'Risk_Adj_EV_Last_3': safe_float(row.get(f'{active}_Risk_Adj_EV_Last_3')),
+                    'Count': safe_int(row.get(f'{active}_Count')),
                 })
         open_signals.sort(key=lambda x: x['Ticker'])
 
