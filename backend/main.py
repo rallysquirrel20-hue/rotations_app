@@ -12,13 +12,17 @@ from datetime import datetime, timedelta
 import asyncio
 import logging
 import signals_engine
+import re
 from zoneinfo import ZoneInfo
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-env_path = Path(__file__).parent / ".env"
+# Load .env: check local backend dir first, then shared ~/Documents/Repositories/.env
+_local_env = Path(__file__).parent / ".env"
+_shared_env = Path.home() / "Documents" / "Repositories" / ".env"
+env_path = _local_env if _local_env.exists() else _shared_env
 load_dotenv(dotenv_path=env_path, override=True)
 
 app = FastAPI()
@@ -45,19 +49,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# PORTABILITY FIX: 
-# Look for 'DATA_PATH' in environment variables, 
+# PORTABILITY FIX:
+# Look for 'DATA_PATH' in environment variables,
 # otherwise default to the relative path where your data usually is.
 DEFAULT_PATH = Path.home() / "Documents" / "Python_Outputs"
-BASE_DIR = Path(os.getenv("PYTHON_OUTPUTS_DIR", str(DEFAULT_PATH)))
+BASE_DIR = Path(os.getenv("PYTHON_OUTPUTS_DIR", str(DEFAULT_PATH))).expanduser()
 
-BASKET_EQUITY_CACHE = BASE_DIR / "data_storage" / "basket_equity_cache"
-BASKET_SIGNALS_CACHE = BASE_DIR / "data_storage" / "basket_signals_cache"
-INDIVIDUAL_SIGNALS_FILE = BASE_DIR / "data_storage" / "signals_cache_500.parquet"
-TOP_500_FILE = BASE_DIR / "data_storage" / "top500stocks.json"
-GICS_MAPPINGS_FILE = BASE_DIR / "data_storage" / "gics_mappings_500.json"
-LIVE_OHLC_FILE = BASE_DIR / "data_storage" / "live_ohlc_today.parquet"
-LIVE_BASKET_OHLC_FILE = BASE_DIR / "data_storage" / "live_basket_ohlc_today.parquet"
+DATA_STORAGE = BASE_DIR / "Data_Storage"
+THEMATIC_BASKET_CACHE = DATA_STORAGE / "thematic_basket_cache"
+SECTOR_BASKET_CACHE = DATA_STORAGE / "sector_basket_cache"
+INDUSTRY_BASKET_CACHE = DATA_STORAGE / "industry_basket_cache"
+BASKET_CACHE_FOLDERS = [THEMATIC_BASKET_CACHE, SECTOR_BASKET_CACHE, INDUSTRY_BASKET_CACHE, DATA_STORAGE]
+INDIVIDUAL_SIGNALS_FILE = DATA_STORAGE / "signals_500.parquet"
+LIVE_SIGNALS_FILE = DATA_STORAGE / "live_signals_500.parquet"
+LIVE_BASKET_SIGNALS_FILE = DATA_STORAGE / "live_basket_signals_500.parquet"
+TOP_500_FILE = DATA_STORAGE / "top500stocks.json"
+GICS_MAPPINGS_FILE = DATA_STORAGE / "gics_mappings_500.json"
 
 THEMATIC_CONFIG = {
     "High_Beta": ("beta_universes_500.json", "high"),
@@ -81,6 +88,30 @@ def _read_live_parquet(path):
     except Exception:
         return None
 
+def _find_basket_parquet(slug):
+    """Glob for a basket parquet by slug prefix across basket cache folders. Returns path or None."""
+    for folder in BASKET_CACHE_FOLDERS:
+        if not folder.exists():
+            continue
+        matches = list(folder.glob(f'{slug}_*_of_*_basket.parquet'))
+        if not matches:
+            matches = list(folder.glob(f'{slug}_of_*_basket.parquet'))
+        if matches:
+            return matches[0]
+    return None
+
+def _find_basket_meta(slug):
+    """Glob for a basket meta JSON by slug prefix across basket cache folders. Returns path or None."""
+    for folder in BASKET_CACHE_FOLDERS:
+        if not folder.exists():
+            continue
+        matches = list(folder.glob(f'{slug}_*_of_*_basket_meta.json'))
+        if not matches:
+            matches = list(folder.glob(f'{slug}_of_*_basket_meta.json'))
+        if matches:
+            return matches[0]
+    return None
+
 _DV_DATA = None
 
 def get_dv_data():
@@ -90,7 +121,7 @@ def get_dv_data():
     try:
         latest_date_df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=['Date'])
         latest_date = latest_date_df['Date'].max()
-        df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, 
+        df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
                              columns=['Ticker', 'Date', 'Close', 'Volume'],
                              filters=[('Date', '==', latest_date)])
         df['Dollar_Vol'] = df['Close'] * df['Volume']
@@ -115,7 +146,7 @@ def get_latest_universe_tickers(basket_name):
                     if qs: return list(d[qs[-1]])
     if basket_name in THEMATIC_CONFIG:
         fn, key = THEMATIC_CONFIG[basket_name]
-        p_path = BASE_DIR / "data_storage" / fn
+        p_path = THEMATIC_BASKET_CACHE / fn
         if p_path.exists():
             with open(p_path, 'r') as f:
                 data = json.load(f)
@@ -126,8 +157,8 @@ def get_latest_universe_tickers(basket_name):
 
 
 def get_meta_file_tickers(basket_name):
-    meta_file = BASKET_EQUITY_CACHE / f"{basket_name}_equity_meta.json"
-    if not meta_file.exists():
+    meta_file = _find_basket_meta(basket_name)
+    if not meta_file:
         return []
     try:
         with open(meta_file, 'r') as f:
@@ -139,8 +170,8 @@ def get_meta_file_tickers(basket_name):
 
 
 def get_meta_file_weights(basket_name):
-    meta_file = BASKET_EQUITY_CACHE / f"{basket_name}_equity_meta.json"
-    if not meta_file.exists():
+    meta_file = _find_basket_meta(basket_name)
+    if not meta_file:
         return {}
     try:
         with open(meta_file, 'r') as f:
@@ -220,96 +251,181 @@ def compute_current_basket_weights(tickers):
         if pd.notna(weight)
     }
 
+def _compute_live_breadth(basket_name):
+    """Compute live-bar Uptrend_Pct, Breakout_Pct, Correlation_Pct from constituent ticker data."""
+    tickers = get_latest_universe_tickers(basket_name)
+    if not tickers:
+        return {}
+
+    live_df = _read_live_parquet(LIVE_SIGNALS_FILE)
+    if live_df is None:
+        return {}
+
+    live_prices = live_df[live_df['Ticker'].isin(tickers)].set_index('Ticker')
+    if live_prices.empty:
+        return {}
+    live_close = live_prices['Close'].to_dict()
+
+    # Read last historical row per constituent
+    needed_cols = ['Ticker', 'Date', 'Close', 'Trend', 'Resistance_Pivot', 'Support_Pivot',
+                   'Upper_Target', 'Lower_Target', 'Is_Breakout_Sequence']
+    hist = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=needed_cols, filters=[('Ticker', 'in', tickers)])
+    last = hist.sort_values('Date').groupby('Ticker').tail(1).set_index('Ticker')
+
+    uptrend = 0
+    bo_seq = 0
+    total = 0
+
+    for t in tickers:
+        if t not in live_close or t not in last.index:
+            continue
+        total += 1
+        lc = live_close[t]
+        r = last.loc[t]
+
+        prev_res = r['Resistance_Pivot']
+        prev_sup = r['Support_Pivot']
+        prev_trend = r['Trend']
+        prev_upper = r['Upper_Target']
+        prev_lower = r['Lower_Target']
+        prev_bo = r['Is_Breakout_Sequence']
+
+        # Incremental trend from pivots
+        is_up_rot = pd.notna(prev_res) and lc > prev_res
+        is_down_rot = pd.notna(prev_sup) and lc < prev_sup
+
+        if is_up_rot:
+            trend = True
+        elif is_down_rot:
+            trend = False
+        else:
+            trend = bool(prev_trend) if pd.notna(prev_trend) else False
+
+        if trend:
+            uptrend += 1
+
+        # Incremental breakout sequence from pivots + targets
+        is_bo = is_up_rot and pd.notna(prev_upper) and lc > prev_upper
+        is_bd = is_down_rot and pd.notna(prev_lower) and lc < prev_lower
+
+        if is_bo:
+            live_bo = True
+        elif is_bd:
+            live_bo = False
+        else:
+            live_bo = bool(prev_bo) if pd.notna(prev_bo) else False
+
+        if live_bo:
+            bo_seq += 1
+
+    if total == 0:
+        return {}
+
+    result = {
+        'Uptrend_Pct': round(uptrend / total * 100, 1),
+        'Breakout_Pct': round(bo_seq / total * 100, 1),
+    }
+
+    # Correlation_Pct: avg pairwise correlation of last 21 days of returns including live
+    try:
+        close_df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=['Ticker', 'Date', 'Close'],
+                                   filters=[('Ticker', 'in', tickers)])
+        pivot = close_df.pivot_table(index='Date', columns='Ticker', values='Close').sort_index()
+
+        # Add live prices as new row
+        live_date = pd.to_datetime(live_df['Date'].iloc[0])
+        live_series = pd.Series(live_close, name=live_date)
+        pivot = pd.concat([pivot, live_series.to_frame().T]).sort_index()
+
+        returns = pivot.pct_change()
+        recent = returns.tail(21)
+        valid = [c for c in recent.columns if recent[c].notna().sum() >= 10]
+        if len(valid) >= 2:
+            corr = recent[valid].corr()
+            mask = np.triu(np.ones(corr.shape, dtype=bool), k=1)
+            vals = corr.values[mask]
+            vals = vals[~np.isnan(vals)]
+            if len(vals) > 0:
+                result['Correlation_Pct'] = round(float(np.mean(vals) * 100), 2)
+    except Exception:
+        pass
+
+    return result
+
+
 @app.get("/")
 def read_root(): return {"status": "ok", "data_path": str(BASE_DIR)}
 
 @app.get("/api/baskets")
 def list_baskets():
-    if not BASKET_EQUITY_CACHE.exists(): return {"Themes": [], "Sectors": [], "Industries": []}
+    if not DATA_STORAGE.exists(): return {"Themes": [], "Sectors": [], "Industries": []}
     t_names = list(THEMATIC_CONFIG.keys())
     s_names = ["Communication_Services", "Consumer_Discretionary", "Consumer_Staples", "Energy", "Financials", "Health_Care", "Industrials", "Information_Technology", "Materials", "Real_Estate", "Utilities"]
     cats = {"Themes": [], "Sectors": [], "Industries": []}
-    for f in BASKET_EQUITY_CACHE.glob("*_equity_ohlc.parquet"):
-        bn = f.name.replace("_equity_ohlc.parquet", "")
-        if bn in t_names: cats["Themes"].append(bn)
-        elif bn in s_names: cats["Sectors"].append(bn)
-        else: cats["Industries"].append(bn)
-    for k in cats: cats[k].sort()
+    for folder in BASKET_CACHE_FOLDERS:
+        if not folder.exists():
+            continue
+        for f in folder.glob("*_of_*_basket.parquet"):
+            name = f.stem
+            name = name.rsplit("_basket", 1)[0]
+            slug = re.sub(r'(_\d+)?_of_\d+$', '', name)
+            if slug in t_names: cats["Themes"].append(slug)
+            elif slug in s_names: cats["Sectors"].append(slug)
+            else: cats["Industries"].append(slug)
+    for k in cats: cats[k] = sorted(set(cats[k]))
     return cats
 
-CORRELATION_FILE = BASE_DIR / "data_storage" / "correlation_cache" / "within_osc_500.parquet"
-
 logger.info(f"BASE_DIR: {BASE_DIR} (exists={BASE_DIR.exists()})")
-logger.info(f"BASKET_SIGNALS_CACHE: {BASKET_SIGNALS_CACHE} (exists={BASKET_SIGNALS_CACHE.exists()})")
-logger.info(f"CORRELATION_FILE: {CORRELATION_FILE} (exists={CORRELATION_FILE.exists()})")
-
-def get_basket_correlation(basket_name):
-    if not CORRELATION_FILE.exists():
-        return pd.Series(dtype=float)
-    try:
-        df_all = pd.read_parquet(CORRELATION_FILE)
-        
-        # Try exact match first
-        search_name = basket_name.replace("_", " ")
-        col_name = f"21|{search_name}"
-        
-        if col_name not in df_all.columns:
-            # Fallback: case-insensitive partial match, normalizing & vs and
-            search_norm = search_name.lower().replace(" & ", " and ")
-            for col in df_all.columns:
-                col_norm = col.lower().replace(" & ", " and ")
-                if search_norm in col_norm:
-                    col_name = col
-                    break
-        
-        if col_name not in df_all.columns:
-            logger.warning(f"Correlation column not found for {basket_name}")
-            return pd.Series(dtype=float)
-            
-        df = df_all[[col_name]].copy()
-        df = df.reset_index()
-        df.columns = ['Date', 'Correlation_Pct']
-        df['Date'] = pd.to_datetime(df['Date'])
-        return df
-    except Exception as e:
-        logger.error(f"Error loading pre-calculated correlation for {basket_name}: {e}")
-        return pd.Series(dtype=float)
+logger.info(f"DATA_STORAGE: {DATA_STORAGE} (exists={DATA_STORAGE.exists()})")
+logger.info(f"INDIVIDUAL_SIGNALS_FILE: {INDIVIDUAL_SIGNALS_FILE} (exists={INDIVIDUAL_SIGNALS_FILE.exists()})")
 
 @app.get("/api/baskets/{basket_name}")
 def get_basket_data(basket_name: str):
-    ohlc_file = BASKET_EQUITY_CACHE / f"{basket_name}_equity_ohlc.parquet"
-    signals_file = BASKET_SIGNALS_CACHE / f"{basket_name}_basket_signals.parquet"
-    if not ohlc_file.exists(): raise HTTPException(status_code=404)
+    basket_file = _find_basket_parquet(basket_name)
+    if not basket_file:
+        raise HTTPException(status_code=404, detail=f"Basket file not found for {basket_name}")
     try:
-        df_ohlc = pd.read_parquet(ohlc_file)
-        df_ohlc['Date'] = pd.to_datetime(df_ohlc['Date'])
+        df = pd.read_parquet(basket_file)
+        df['Date'] = pd.to_datetime(df['Date'])
 
-        # Merge live basket data for today's candle
-        live_basket_df = _read_live_parquet(LIVE_BASKET_OHLC_FILE)
+        # Merge live basket data for today's candle with recomputed signals
+        live_basket_df = _read_live_parquet(LIVE_BASKET_SIGNALS_FILE)
         if live_basket_df is not None:
-            live_row = live_basket_df[live_basket_df['Basket'] == basket_name]
+            name_col = 'BasketName' if 'BasketName' in live_basket_df.columns else 'Basket'
+            basket_name_spaced = basket_name.replace('_', ' ')
+            live_row = live_basket_df[live_basket_df[name_col].str.endswith(basket_name_spaced)]
             if not live_row.empty:
                 live_row = live_row.copy()
                 live_row['Date'] = pd.to_datetime(live_row['Date'])
-                live_row = live_row.drop(columns=['Basket'])
-                df_ohlc = pd.concat([df_ohlc, live_row], ignore_index=True)
-                df_ohlc = df_ohlc.drop_duplicates(subset=['Date'], keep='last')
+                live_row = live_row.drop(columns=[name_col])
 
-        if signals_file.exists():
-            df_s = pd.read_parquet(signals_file)
-            df_s['Date'] = pd.to_datetime(df_s['Date'])
-            df = pd.merge(df_ohlc, df_s.drop(columns=[c for c in ['Open','High','Low','Close','Volume'] if c in df_s.columns]), on='Date', how='left')
-        else:
-            df = df_ohlc
+                # Recompute basket-level signals (pivots, targets) on combined OHLC
+                ohlc_cols = [c for c in ['Date', 'Open', 'High', 'Low', 'Close', 'Volume'] if c in df.columns]
+                live_ohlc = live_row[[c for c in ohlc_cols if c in live_row.columns]].copy()
+                if 'Volume' not in live_ohlc.columns:
+                    live_ohlc['Volume'] = 0
+                combined_ohlc = pd.concat([df[ohlc_cols], live_ohlc], ignore_index=True)
+                combined_ohlc = combined_ohlc.drop_duplicates(subset=['Date'], keep='last').sort_values('Date')
 
-        # LOAD PRE-CALCULATED CORRELATION
-        corr_df = get_basket_correlation(basket_name)
-        logger.info(f"Loaded correlation data for {basket_name}: {len(corr_df)} rows")
-        
-        if not corr_df.empty:
-            df = pd.merge(df, corr_df, on='Date', how='left')
-            logger.info(f"Merged chart data rows: {len(df)}, Non-null Correlation: {df['Correlation_Pct'].notna().sum()}")
-        
+                ticker_label = df['Ticker'].iloc[0] if 'Ticker' in df.columns and not df['Ticker'].isna().all() else basket_name.upper()
+                recomputed = signals_engine._build_signals_from_df(combined_ohlc.set_index('Date'), ticker_label)
+
+                if recomputed is not None and not recomputed.empty:
+                    # Take only the live bar's recomputed signals
+                    live_computed = recomputed.iloc[[-1]].copy()
+
+                    # Compute breadth metrics for the live bar
+                    breadth = _compute_live_breadth(basket_name)
+                    for col, val in breadth.items():
+                        live_computed[col] = val
+
+                    df = pd.concat([df, live_computed], ignore_index=True)
+                    df = df.drop_duplicates(subset=['Date'], keep='last')
+                else:
+                    # Fallback: just append OHLC
+                    df = pd.concat([df, live_row], ignore_index=True)
+                    df = df.drop_duplicates(subset=['Date'], keep='last')
+
         latest_universe = get_latest_universe_tickers(basket_name)
         tickers = []
         current_weights = compute_current_basket_weights(latest_universe) if latest_universe else {}
@@ -317,7 +433,7 @@ def get_basket_data(basket_name: str):
             tickers = sorted([{"symbol": s, "weight": float(w)} for s, w in current_weights.items()], key=lambda x: x['weight'], reverse=True)
         elif latest_universe:
             tickers = [{"symbol": symbol, "weight": 0.0} for symbol in latest_universe]
-            
+
         return {"chart_data": clean_data_for_json(df), "tickers": tickers}
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
@@ -341,36 +457,49 @@ def get_ticker_data(ticker: str):
     if not INDIVIDUAL_SIGNALS_FILE.exists(): raise HTTPException(status_code=404)
     try:
         df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, filters=[('Ticker', '==', ticker)])
-        if 'Date' in df.columns: df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
+        df['Date'] = pd.to_datetime(df['Date'])
 
-        # Merge live data from parquet for today's candle
-        live_df = _read_live_parquet(LIVE_OHLC_FILE)
+        # Merge live data and recompute signals for today's candle
+        live_df = _read_live_parquet(LIVE_SIGNALS_FILE)
         if live_df is not None:
             live_row = live_df[live_df['Ticker'] == ticker]
             if not live_row.empty:
                 live_row = live_row.copy()
-                live_row['Date'] = pd.to_datetime(live_row['Date']).dt.strftime('%Y-%m-%d')
-                live_row = live_row.drop(columns=['Ticker'])
-                df = pd.concat([df, live_row[['Date', 'Open', 'High', 'Low', 'Close', 'Volume']]], ignore_index=True)
-                df = df.drop_duplicates(subset=['Date'], keep='last')
+                live_row['Date'] = pd.to_datetime(live_row['Date'])
 
+                # Build combined OHLC and recompute all signals including live bar
+                ohlc_cols = ['Date', 'Open', 'High', 'Low', 'Close']
+                if 'Volume' in df.columns:
+                    ohlc_cols.append('Volume')
+                live_ohlc = live_row[[c for c in ohlc_cols if c in live_row.columns]].copy()
+                if 'Volume' not in live_ohlc.columns:
+                    live_ohlc['Volume'] = 0
+                combined = pd.concat([df[ohlc_cols], live_ohlc], ignore_index=True)
+                combined = combined.drop_duplicates(subset=['Date'], keep='last').sort_values('Date')
+
+                result = signals_engine._build_signals_from_df(combined.set_index('Date'), ticker)
+                if result is not None:
+                    result['Date'] = pd.to_datetime(result['Date']).dt.strftime('%Y-%m-%d')
+                    return {"chart_data": clean_data_for_json(result.sort_values('Date')), "tickers": []}
+
+        df['Date'] = df['Date'].dt.strftime('%Y-%m-%d')
         return {"chart_data": clean_data_for_json(df.sort_values('Date')), "tickers": []}
-    except: raise HTTPException(status_code=500)
+    except Exception: raise HTTPException(status_code=500)
 
 @app.get("/api/tickers/{ticker}/intraday")
 def get_intraday_data(ticker: str, response: Response, interval: str = "1m"):
     # Force browser to never cache intraday data
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-    
+
     # Target the new Intraday_Data parquet files
     intraday_file = BASE_DIR / "Intraday_Data" / f"{ticker}_1m.parquet"
-    
+
     try:
         if not intraday_file.exists():
             # Fallback to Databento API if parquet hasn't been built yet
-            if not db_client: 
+            if not db_client:
                 raise HTTPException(status_code=503, detail="Databento client not configured and parquet not found")
-            
+
             fetch_interval = "1m" if interval in ["5m", "30m"] else interval
             schema = f"ohlcv-{fetch_interval}"
             start = (datetime.now() - timedelta(days=4)).strftime("%Y-%m-%d")
@@ -379,11 +508,11 @@ def get_intraday_data(ticker: str, response: Response, interval: str = "1m"):
             )
             df = data.to_df()
             if df.empty: return {"chart_data": []}
-            
+
             # Standardize column names
             rename_map = {'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}
             df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-            
+
             # Convert to NY and Filter RTH
             df.index = df.index.tz_convert('America/New_York')
             df = df.between_time('09:30', '15:59')
@@ -392,7 +521,7 @@ def get_intraday_data(ticker: str, response: Response, interval: str = "1m"):
             df = pd.read_parquet(intraday_file)
             df['Date'] = pd.to_datetime(df['Date'])
             df.index = df['Date']
-            
+
             # Convert to NY and Filter RTH
             df.index = df.index.tz_convert('America/New_York')
             df = df.between_time('09:30', '15:59')
@@ -416,7 +545,7 @@ def get_intraday_data(ticker: str, response: Response, interval: str = "1m"):
         # Format as Nominal Local Time (No Z)
         if 'Date' not in df.columns: df = df.reset_index()
         df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%dT%H:%M:%S')
-        
+
         return {"chart_data": clean_data_for_json(df.sort_values('Date'))}
     except Exception as e:
         logger.error(f"Error in get_intraday_data for {ticker}: {e}")
@@ -601,7 +730,7 @@ async def websocket_endpoint(websocket: WebSocket, ticker: str):
             # Format record for frontend - Convert UTC to NY
             dt_utc = datetime.fromtimestamp(record.ts_event / 1e9, tz=ZoneInfo("UTC"))
             dt_ny = dt_utc.astimezone(ZoneInfo("America/New_York"))
-            
+
             # FILTER RTH: Drop anything outside 09:30 - 16:00
             if dt_ny.hour < 9 or (dt_ny.hour == 9 and dt_ny.minute < 30) or dt_ny.hour >= 16:
                 return

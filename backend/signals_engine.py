@@ -18,8 +18,8 @@ EMA_MULT = 2.0 / 11.0
 RV_EMA_ALPHA = 2.0 / 11.0
 
 ET = ZoneInfo("America/New_York")
-BASE_OUTPUT_FOLDER = Path(os.getenv("PYTHON_OUTPUTS_DIR", Path.home() / "Documents" / "Python_Outputs"))
-PICKLE_FOLDER = BASE_OUTPUT_FOLDER / "data_storage"
+BASE_OUTPUT_FOLDER = Path(os.getenv("PYTHON_OUTPUTS_DIR", Path.home() / "Documents" / "Python_Outputs")).expanduser()
+PICKLE_FOLDER = BASE_OUTPUT_FOLDER / "Data_Storage"
 PICKLE_FOLDER.mkdir(parents=True, exist_ok=True)
 
 UNIVERSE_PICKLE_PATH = Path(os.getenv("UNIVERSE_PICKLE_PATH", PICKLE_FOLDER / f"top{SIZE}stocks.pkl"))
@@ -44,7 +44,11 @@ def _load_env_file():
         base_path = Path(__file__).resolve().parent
     except NameError:
         base_path = Path.cwd()
-    load_dotenv(base_path / ".env", override=False)
+    # Load .env: check local backend dir first, then shared ~/Documents/Repositories/.env
+    local_env = base_path / ".env"
+    shared_env = Path.home() / "Documents" / "Repositories" / ".env"
+    env_path = local_env if local_env.exists() else shared_env
+    load_dotenv(env_path, override=False)
 
 
 def _refresh_runtime_config():

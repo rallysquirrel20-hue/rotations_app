@@ -14,21 +14,31 @@ Full-stack financial analysis dashboard for visualizing stock rotation signals, 
 
 ## Commands
 
-```bash
-# Backend
-cd backend
-pip install fastapi uvicorn pandas numpy databento python-dotenv pyarrow
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+All commands are run from the repository root.
 
-# Frontend
+```bash
+# Setup & Sync (Clone or Refresh - Warning: deletes local changes)
+rm -rf ./rotations_app && git clone https://github.com/rallysquirrel20-hue/rotations_app.git
+
+# Backend — activate venv then start server
+cd backend
+python -m venv venv                # first time only
+source venv/bin/activate           # Linux/macOS
+# .\venv\Scripts\Activate.ps1     # Windows (PowerShell)
+pip install -r requirements.txt    # or: pip install fastapi uvicorn pandas numpy databento python-dotenv pyarrow
+python main.py                     # starts uvicorn on http://0.0.0.0:8000
+
+# Frontend — install deps then start dev server
 cd frontend
-npm install
-npm run dev        # Dev server on http://localhost:5173
-npm run build      # tsc -b && vite build
-npm run lint       # eslint .
+npm install                        # first time only
+npm run dev                        # Dev server on http://localhost:5173
+npm run build                      # tsc -b && vite build
+npm run lint                       # eslint .
 ```
 
-## Environment Variables (backend `.env`)
+## Environment Variables
+
+The backend auto-loads `.env` from the local `backend/` directory first, falling back to `~/Documents/Repositories/.env`. Place the file in either location — no manual copying needed.
 
 - `DATABENTO_API_KEY` — Required for live/intraday data
 - `DATABENTO_DATASET` — Default: `EQUS.MINI`
@@ -55,12 +65,12 @@ API endpoints:
 - `WebSocket /ws/live/{ticker}` — Real-time 1-minute bars from Databento Live API
 
 Data sources (read from `PYTHON_OUTPUTS_DIR`):
-- `Pickle_Files/signals_cache_500.parquet` — Individual ticker signals
-- `Pickle_Files/basket_equity_cache/{slug}_equity_ohlc.parquet` — Basket OHLC
-- `Pickle_Files/basket_signals_cache/{slug}_basket_signals.parquet` — Basket signals
-- `Pickle_Files/correlation_cache/within_osc_500.parquet` — Pre-computed correlations
-- `Pickle_Files/gics_mappings_500.json` — Sector/industry ticker mappings
-- `Pickle_Files/top500stocks.json` — Quarterly universe
+- `Data_Storage/signals_cache_500.parquet` — Individual ticker signals
+- `Data_Storage/basket_equity_cache/{slug}_equity_ohlc.parquet` — Basket OHLC
+- `Data_Storage/basket_signals_cache/{slug}_basket_signals.parquet` — Basket signals
+- `Data_Storage/correlation_cache/within_osc_500.parquet` — Pre-computed correlations
+- `Data_Storage/gics_mappings_500.json` — Sector/industry ticker mappings
+- `Data_Storage/top500stocks.json` — Quarterly universe
 
 **`signals_engine.py`** — Intraday signal calculation engine. Fetches 1-minute bars from Databento, resamples to 30-minute, and runs the same 3-phase rotation algorithm used in `rotations_signals`:
 

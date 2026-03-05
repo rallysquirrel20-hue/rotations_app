@@ -262,8 +262,12 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
       source.subscribeCrosshairMove(p => {
         if (crosshairSyncing) return;
         crosshairSyncing = true;
-        chartEntries.forEach(([otherId, target]) => {
-          if (target !== source) {
+        try {
+          chartEntries.forEach(([otherId, target]) => {
+            if (target === source) return;
+            // Skip charts whose container is hidden (e.g. volume in basket view)
+            const container = { price: pRef, volume: vRef, breadth: bRef, breakout: boRef, correlation: cRef }[otherId];
+            if (container?.current && container.current.clientHeight === 0) return;
             const s = seriesRefs.current[otherId];
             if (!s) return;
             if (!p.time) {
@@ -274,9 +278,10 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
                 target.setCrosshairPosition(val, p.time as any, s);
               }
             }
-          }
-        });
-        crosshairSyncing = false;
+          });
+        } finally {
+          crosshairSyncing = false;
+        }
       });
     });
 

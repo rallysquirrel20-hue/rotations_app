@@ -1,45 +1,35 @@
-# Rotations App - Gemini Context
+# 🚀 Rotations App - Startup Guide
 
-This document provides foundational context and instructions for AI agents working on the Rotations App project.
+This file contains machine-agnostic commands to run the Rotations App on any PC.
 
-## Project Overview
-The Rotations App is a financial analysis tool designed to track and visualize stock rotations, thematic universes (e.g., High Beta, Momentum), and sector performance using data from Databento.
+## 1. Environment Setup
+The backend auto-loads `.env` from the local `backend/` directory first, falling back to `~/Documents/Repositories/.env`. No manual copying needed — just ensure the `.env` file exists in either location.
 
-## Tech Stack
-### Backend
-- **Framework:** FastAPI (Python)
-- **Data Processing:** Pandas, NumPy
-- **Data Source:** Databento (API-based historical and real-time data)
-- **Caching/Storage:** Pickle files, Parquet (using `fastparquet` or `pyarrow`)
-- **Key Modules:**
-    - `backend/main.py`: FastAPI application entry point, WebSocket management, and API endpoints.
-    - `backend/signals_engine.py`: Core logic for calculating rotation signals and technical indicators.
+## 2. Backend (FastAPI)
+Open a **new** PowerShell tab and run:
+```powershell
+cd "$HOME\Documents\Repositories\rotations_app\backend"
+# Install dependencies (only needed once)
+python -m pip install fastapi uvicorn pandas numpy databento python-dotenv pyarrow
 
-### Frontend
-- **Framework:** React (TypeScript)
-- **Build Tool:** Vite
-- **Charting:** `lightweight-charts` (TradingView)
-- **Communication:** Axios for REST API, WebSockets for real-time updates.
-- **Styling:** CSS (Modular or Vanilla as per conventions).
+# Start the server
+python -m uvicorn main:app --reload
+```
+*The API will be live at http://localhost:8000*
 
-## Project Structure
-- `/backend`: Contains the FastAPI server and data processing scripts.
-- `/frontend`: Contains the React/Vite application.
-- `/Documents/Python_Outputs`: External data directory for cache files (Pickle, Parquet).
+## 3. Frontend (React + Vite)
+Open a **second** PowerShell tab and run:
+```powershell
+cd "$HOME\Documents\Repositories\rotations_app\frontend"
+# Install dependencies (only needed once)
+npm install
 
-## Development Guidelines
-### Backend
-- **Environment Variables:** All secrets and paths (API keys, data directories) must be managed via `.env`.
-- **Data Consistency:** Ensure dataframes are properly indexed by `Date` and `Ticker` before processing signals.
-- **Error Handling:** Use explicit HTTPExceptions in FastAPI and robust logging for data ingestion issues.
+# Start the dashboard
+npm run dev
+```
+*The App will be live at http://localhost:5173*
 
-### Frontend
-- **Type Safety:** Maintain strict TypeScript typing for all API responses and component props.
-- **Performance:** Optimize chart rendering, especially when handling large datasets or high-frequency WebSocket updates.
-- **State Management:** Use React hooks (useState, useEffect) for local state; consider more robust solutions only if complexity increases significantly.
-
-## Key Files & Paths
-- **Backend Entry:** `backend/main.py`
-- **Signals Logic:** `backend/signals_engine.py`
-- **Frontend Source:** `frontend/src/`
-- **Data Cache (Local):** Defined by `PYTHON_OUTPUTS_DIR` in `.env`.
+## 4. Troubleshooting
+- **Data Not Found:** Ensure `PYTHON_OUTPUTS_DIR` in `.env` points to your local outputs folder (defaults to `~/Documents/Python_Outputs`).
+- **Node/NPM Errors:** Ensure Node.js is installed. Run `node -v` to check.
+- **Python Errors:** Ensure Python 3.10+ is installed. Run `python --version` to check.

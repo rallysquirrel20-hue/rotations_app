@@ -1,7 +1,7 @@
 import pickle
 from pathlib import Path
 
-BASE_DIR = Path(r"C:\Users\xbtsq\Documents\Python_Outputs\Pickle_Files")
+BASE_DIR = Path.home() / "Documents" / "Python_Outputs" / "Data_Storage"
 files = [
     "beta_universes_500.pkl",
     "dividend_universes_500.pkl",
