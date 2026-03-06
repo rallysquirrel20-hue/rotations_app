@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef, Component, ReactNode } from 'react'
+import { useEffect, useState, useRef, useMemo, Component, ReactNode } from 'react'
 import axios from 'axios'
 import { TVChart } from './components/TVChart'
 import { BasketSummary } from './components/BasketSummary'
@@ -84,12 +84,17 @@ function App() {
   const [showSummary, setShowSummary] = useState(false)
   const [summaryData, setSummaryData] = useState<BasketSummaryData | null>(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
-  const [chartHeightPct, setChartHeightPct] = useState(50)
-  const summaryDrag = useRef<{ startY: number; startPct: number; stackH: number } | null>(null)
   const contentStackRef = useRef<HTMLDivElement>(null)
 
   const isBasketView = viewType !== 'Tickers' && !activeTicker
   const canShowSummary = isBasketView && timeframe === 'Daily'
+
+  // Derive min/max dates from loaded chart data for date picker bounds
+  const dateBounds = useMemo(() => {
+    if (!chartData || chartData.length === 0) return { min: '', max: '' }
+    const dates = chartData.map((d: any) => String(d.Date).slice(0, 10)).filter(Boolean).sort()
+    return { min: dates[0] || '', max: dates[dates.length - 1] || '' }
+  }, [chartData])
 
   useEffect(() => {
     axios.get(`${API_BASE}/baskets`).then(res => {
@@ -183,26 +188,6 @@ function App() {
     }
   }, [canShowSummary, selectedItem, showSummary])
 
-  useEffect(() => {
-    const onMouseMove = (e: MouseEvent) => {
-      if (!summaryDrag.current) return;
-      const { startY, startPct, stackH } = summaryDrag.current;
-      const deltaY = e.clientY - startY;
-      const newPct = Math.max(20, Math.min(80, startPct + (deltaY / stackH) * 100));
-      setChartHeightPct(newPct);
-    };
-    const onMouseUp = () => {
-      summaryDrag.current = null;
-      document.body.style.cursor = 'default';
-    };
-    window.addEventListener('mousemove', onMouseMove);
-    window.addEventListener('mouseup', onMouseUp);
-    return () => {
-      window.removeEventListener('mousemove', onMouseMove);
-      window.removeEventListener('mouseup', onMouseUp);
-    };
-  }, []);
-
   const handleViewTypeChange = (type: ViewType) => {
     setViewType(type); setActiveTicker(null); setTimeframe('Daily'); setShowSummary(false); setSummaryData(null)
     if (type === 'Themes' && baskets.Themes.length > 0) setSelectedItem(baskets.Themes[0]);
@@ -273,9 +258,9 @@ function App() {
                 </div>
               )}
               <div className="date-range-group">
-                <input type="date" className="date-input" value={startDate} onChange={e => setStartDate(e.target.value)} />
+                <input type="date" className="date-input" value={startDate} min={dateBounds.min} max={dateBounds.max} onChange={e => setStartDate(e.target.value)} />
                 <span className="date-separator">to</span>
-                <input type="date" className="date-input" value={endDate} onChange={e => setEndDate(e.target.value)} />
+                <input type="date" className="date-input" value={endDate} min={dateBounds.min} max={dateBounds.max} onChange={e => setEndDate(e.target.value)} />
                 <button className="control-btn primary" onClick={() => setRangeUpdateTrigger({ from: startDate, to: endDate })}>Go</button>
               </div>
               {canShowSummary && (
@@ -283,15 +268,18 @@ function App() {
                   className={`control-btn ${showSummary ? 'primary' : ''}`}
                   onClick={() => setShowSummary(prev => !prev)}
                 >
-                  Summary
+                  Basket Analysis
                 </button>
               )}
               <button className="control-btn" onClick={() => setRangeUpdateTrigger({ reset1Y: true })}>Reset 1Y</button>
               <button className="control-btn" onClick={() => setExportTrigger(p => p + 1)}>Export Image</button>
             </div>
           </div>
-          <div className={`content-stack ${showSummary ? 'with-summary' : ''}`} ref={contentStackRef}>
-            <div className="chart-container" style={showSummary ? { flex: `0 0 ${chartHeightPct}%` } : undefined}>
+          <div className="content-stack" ref={contentStackRef}>
+            {showSummary ? (
+              <BasketSummary data={summaryData} loading={summaryLoading} basketName={selectedItem} apiBase={API_BASE} />
+            ) : (
+            <div className="chart-container">
             <div className="chart-overlay-toggles">
               <label className="overlay-checkbox"><input type="checkbox" checked={showPivots} onChange={e => setShowPivots(e.target.checked)} /> Pivots</label>
               <label className="overlay-checkbox"><input type="checkbox" checked={showTargets} onChange={e => setShowTargets(e.target.checked)} /> Targets</label>
@@ -320,29 +308,11 @@ function App() {
                 rangeUpdateTrigger={rangeUpdateTrigger}
                 exportTrigger={exportTrigger}
                 symbolName={activeTicker || selectedItem}
-                layoutHeight={showSummary ? chartHeightPct : undefined}
               />
             ) : (
-
               <div className="no-data">{selectedItem ? "No data found" : "Select an item"}</div>
             )}
             </div>
-            {showSummary && (
-              <div
-                className="summary-resizer"
-                onMouseDown={(e) => {
-                  e.preventDefault();
-                  summaryDrag.current = {
-                    startY: e.clientY,
-                    startPct: chartHeightPct,
-                    stackH: contentStackRef.current?.clientHeight ?? 600,
-                  };
-                  document.body.style.cursor = 'ns-resize';
-                }}
-              />
-            )}
-            {showSummary && (
-              <BasketSummary data={summaryData} loading={summaryLoading} />
             )}
           </div>
         </div>

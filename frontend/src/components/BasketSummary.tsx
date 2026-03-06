@@ -1,4 +1,5 @@
 import { useState, useMemo, useRef, useEffect } from 'react'
+import axios from 'axios'
 
 interface OpenSignal {
   Ticker: string
@@ -20,16 +21,19 @@ interface OpenSignal {
   Risk_Adj_EV: number | null
   Risk_Adj_EV_Last_3: number | null
   Count: number
+  Is_Live?: boolean
 }
 
 interface CorrelationData {
   labels: string[]
   matrix: (number | null)[][]
+  min_date?: string
+  max_date?: string
 }
 
 interface CumulativeReturnsData {
   dates: string[]
-  series: { ticker: string; values: (number | null)[] }[]
+  series: { ticker: string; values: (number | null)[]; join_date?: string | null }[]
 }
 
 interface BasketSummaryProps {
@@ -39,6 +43,8 @@ interface BasketSummaryProps {
     cumulative_returns: CumulativeReturnsData
   } | null
   loading: boolean
+  basketName: string
+  apiBase: string
 }
 
 type SortKey = keyof OpenSignal
@@ -70,8 +76,8 @@ function pctFmtCell(v: CellValue): string {
 
 function colorForPerf(v: number | null): string {
   if (v === null) return '#6c757d'
-  if (v > 0) return '#16a34a'
-  if (v < 0) return '#dc2626'
+  if (v > 0) return 'rgb(50, 50, 255)'
+  if (v < 0) return 'rgb(255, 50, 150)'
   return '#6c757d'
 }
 
@@ -93,6 +99,15 @@ function corrColor(v: number | null): string {
   } else {
     return `rgb(255, ${Math.round(255 - t * 205)}, ${Math.round(255 - t * 105)})`
   }
+}
+
+const LIVE_ROW_COLORS: Record<string, string> = {
+  Down_Rot: 'rgba(255, 50, 150, 0.12)',
+  Up_Rot: 'rgba(50, 50, 255, 0.12)',
+  BTFD: 'rgba(255, 50, 150, 0.12)',
+  STFR: 'rgba(50, 50, 255, 0.12)',
+  Breakdown: 'rgba(255, 50, 150, 0.12)',
+  Breakout: 'rgba(50, 50, 255, 0.12)',
 }
 
 function SignalsTable({ signals }: { signals: OpenSignal[] }) {
@@ -152,7 +167,8 @@ function SignalsTable({ signals }: { signals: OpenSignal[] }) {
         </thead>
         <tbody>
           {sorted.map((row, i) => (
-            <tr key={i} className="summary-tr">
+            <tr key={i} className="summary-tr"
+                style={row.Is_Live ? { backgroundColor: LIVE_ROW_COLORS[row.Signal_Type] || 'transparent' } : undefined}>
               {columns.map(col => {
                 const val = row[col.key]
                 const display = col.fmt ? col.fmt(val) : String(val)
@@ -160,6 +176,7 @@ function SignalsTable({ signals }: { signals: OpenSignal[] }) {
                 return (
                   <td key={col.key} className="summary-td" style={{ color }}>
                     {display}
+                    {col.key === 'Signal_Type' && row.Is_Live && <span className="live-tag">LIVE</span>}
                   </td>
                 )
               })}
@@ -172,10 +189,38 @@ function SignalsTable({ signals }: { signals: OpenSignal[] }) {
   )
 }
 
-function CorrelationHeatmap({ data }: { data: CorrelationData }) {
-  const { labels, matrix } = data
+function CorrelationHeatmap({ data, basketName, apiBase }: { data: CorrelationData; basketName: string; apiBase: string }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [dims, setDims] = useState({ w: 600, h: 400 })
+  const [corrDate, setCorrDate] = useState('')
+  const [liveData, setLiveData] = useState<CorrelationData | null>(null)
+  const [dateBounds, setDateBounds] = useState<{ min: string; max: string }>({ min: '', max: '' })
+  const [loading, setLoading] = useState(false)
+
+  // Fetch date bounds on mount
+  useEffect(() => {
+    if (!basketName || !apiBase) return
+    axios.get(`${apiBase}/baskets/${encodeURIComponent(basketName)}/correlation`)
+      .then(res => {
+        if (res.data.min_date && res.data.max_date) {
+          setDateBounds({ min: res.data.min_date, max: res.data.max_date })
+        }
+      })
+      .catch(() => {})
+  }, [basketName, apiBase])
+
+  // Fetch correlation for selected date
+  useEffect(() => {
+    if (!corrDate || !basketName || !apiBase) {
+      setLiveData(null)
+      return
+    }
+    setLoading(true)
+    axios.get(`${apiBase}/baskets/${encodeURIComponent(basketName)}/correlation?date=${corrDate}`)
+      .then(res => setLiveData(res.data))
+      .catch(() => setLiveData(null))
+      .finally(() => setLoading(false))
+  }, [corrDate, basketName, apiBase])
 
   useEffect(() => {
     const el = containerRef.current
@@ -188,18 +233,36 @@ function CorrelationHeatmap({ data }: { data: CorrelationData }) {
     return () => obs.disconnect()
   }, [])
 
-  if (!labels.length) return <div className="summary-empty">No correlation data</div>
+  const active = liveData || data
+  const { labels, matrix } = active
 
-  // Reserve space for row labels and header labels
+  if (!labels.length && !loading) return <div className="summary-empty">No correlation data</div>
+
+  // Reserve space for row labels, header labels, and controls bar
+  const controlBarHeight = 36
   const labelMargin = 60
   const legendHeight = 24
   const availW = dims.w - labelMargin
-  const availH = dims.h - labelMargin - legendHeight
-  const cellSize = Math.max(8, Math.min(40, Math.floor(Math.min(availW, availH) / labels.length)))
+  const availH = dims.h - labelMargin - legendHeight - controlBarHeight
+  const cellSize = labels.length ? Math.max(8, Math.min(40, Math.floor(Math.min(availW, availH) / labels.length))) : 20
+
   const showValues = cellSize >= 28
 
   return (
     <div className="corr-wrapper" ref={containerRef}>
+      <div className="analysis-date-controls">
+        <label className="analysis-date-label">As of:</label>
+        <input
+          type="date"
+          className="date-input"
+          value={corrDate}
+          min={dateBounds.min}
+          max={dateBounds.max}
+          onChange={e => setCorrDate(e.target.value)}
+        />
+        {corrDate && <button className="control-btn" onClick={() => setCorrDate('')}>Reset</button>}
+        {loading && <span className="analysis-loading-hint">Loading...</span>}
+      </div>
       <div className="corr-scroll">
         <table className="corr-table" style={{ borderCollapse: 'collapse' }}>
           <thead>
@@ -243,9 +306,66 @@ function ReturnsChart({ data }: { data: CumulativeReturnsData }) {
   const [hoveredTicker, setHoveredTicker] = useState<string | null>(null)
   const [dims, setDims] = useState({ w: 800, h: 400 })
 
-  // Sort series by latest return value, highest to lowest
+  // Date range state — default to 1Y lookback
+  const allDates = data.dates
+  const defaultEnd = allDates.length > 0 ? allDates[allDates.length - 1] : ''
+  const defaultStart = useMemo(() => {
+    if (!allDates.length) return ''
+    const end = new Date(allDates[allDates.length - 1])
+    end.setFullYear(end.getFullYear() - 1)
+    const target = end.toISOString().slice(0, 10)
+    // Find the closest date in allDates that is >= target
+    for (let i = 0; i < allDates.length; i++) {
+      if (allDates[i] >= target) return allDates[i]
+    }
+    return allDates[0]
+  }, [allDates])
+
+  const [startDate, setStartDate] = useState('')
+  const [endDate, setEndDate] = useState('')
+
+  // Initialize defaults when data loads
+  useEffect(() => {
+    setStartDate(defaultStart)
+    setEndDate(defaultEnd)
+  }, [defaultStart, defaultEnd])
+
+  const dateBoundsMin = allDates.length > 0 ? allDates[0] : ''
+  const dateBoundsMax = allDates.length > 0 ? allDates[allDates.length - 1] : ''
+
+  // Slice data to selected date range and re-rebase to window start
+  const windowedData = useMemo(() => {
+    if (!allDates.length || !startDate || !endDate) return { dates: allDates, series: data.series }
+    let si = 0, ei = allDates.length - 1
+    for (let i = 0; i < allDates.length; i++) {
+      if (allDates[i] >= startDate) { si = i; break }
+    }
+    for (let i = allDates.length - 1; i >= 0; i--) {
+      if (allDates[i] <= endDate) { ei = i; break }
+    }
+    if (si > ei) return { dates: [], series: [] }
+    const slicedDates = allDates.slice(si, ei + 1)
+    const slicedSeries = data.series.map(s => {
+      const vals = s.values.slice(si, ei + 1)
+      // Find first non-null value in window to rebase from (0% at window start or join date)
+      let baseVal: number | null = null
+      for (let i = 0; i < vals.length; i++) {
+        if (vals[i] !== null) { baseVal = vals[i]!; break }
+      }
+      if (baseVal === null || baseVal === 0) return { ...s, values: vals }
+      // Rebase: convert from join-date-relative to window-start-relative
+      const rebased = vals.map(v => {
+        if (v === null) return null
+        return (1 + v) / (1 + baseVal!) - 1
+      })
+      return { ...s, values: rebased }
+    })
+    return { dates: slicedDates, series: slicedSeries }
+  }, [allDates, data.series, startDate, endDate])
+
+  // Sort series by latest return value in the windowed range
   const sortedSeries = useMemo(() => {
-    const withLatest = data.series.map((s, origIndex) => {
+    const withLatest = windowedData.series.map((s, origIndex) => {
       let lastVal = 0
       for (let i = s.values.length - 1; i >= 0; i--) {
         if (s.values[i] !== null) { lastVal = s.values[i]!; break }
@@ -254,7 +374,7 @@ function ReturnsChart({ data }: { data: CumulativeReturnsData }) {
     })
     withLatest.sort((a, b) => b.lastVal - a.lastVal)
     return withLatest
-  }, [data.series])
+  }, [windowedData.series])
 
   useEffect(() => {
     const el = containerRef.current
@@ -269,7 +389,7 @@ function ReturnsChart({ data }: { data: CumulativeReturnsData }) {
 
   useEffect(() => {
     const canvas = canvasRef.current
-    if (!canvas || !data.dates.length || !data.series.length) return
+    if (!canvas || !windowedData.dates.length || !windowedData.series.length) return
     const ctx = canvas.getContext('2d')
     if (!ctx) return
 
@@ -282,15 +402,16 @@ function ReturnsChart({ data }: { data: CumulativeReturnsData }) {
     const plotW = dims.w - pad.left - pad.right
     const plotH = dims.h - pad.top - pad.bottom
 
-    // Find Y range
+    // Find Y range from windowed data
     let yMin = 0, yMax = 0
-    data.series.forEach(s => s.values.forEach(v => {
+    windowedData.series.forEach(s => s.values.forEach(v => {
       if (v !== null) { yMin = Math.min(yMin, v); yMax = Math.max(yMax, v) }
     }))
     const yPad = (yMax - yMin) * 0.1 || 0.05
     yMin -= yPad; yMax += yPad
 
-    const xScale = (i: number) => pad.left + (i / (data.dates.length - 1)) * plotW
+    const numDates = windowedData.dates.length
+    const xScale = (i: number) => pad.left + (numDates > 1 ? (i / (numDates - 1)) * plotW : plotW / 2)
     const yScale = (v: number) => pad.top + plotH - ((v - yMin) / (yMax - yMin)) * plotH
 
     ctx.clearRect(0, 0, dims.w, dims.h)
@@ -316,11 +437,11 @@ function ReturnsChart({ data }: { data: CumulativeReturnsData }) {
     ctx.setLineDash([])
 
     // X axis labels
-    const labelInterval = Math.max(1, Math.floor(data.dates.length / 8))
+    const labelInterval = Math.max(1, Math.floor(numDates / 8))
     ctx.fillStyle = '#6c757d'; ctx.font = '10px sans-serif'; ctx.textAlign = 'center'
-    for (let i = 0; i < data.dates.length; i += labelInterval) {
+    for (let i = 0; i < numDates; i += labelInterval) {
       const x = xScale(i)
-      ctx.fillText(data.dates[i].slice(0, 7), x, dims.h - pad.bottom + 15)
+      ctx.fillText(windowedData.dates[i].slice(0, 7), x, dims.h - pad.bottom + 15)
     }
 
     // Draw lines (use origIndex for consistent color mapping)
@@ -341,7 +462,7 @@ function ReturnsChart({ data }: { data: CumulativeReturnsData }) {
       ctx.stroke()
       ctx.globalAlpha = 1
     })
-  }, [data, dims, hoveredTicker, sortedSeries])
+  }, [windowedData, dims, hoveredTicker, sortedSeries])
 
   return (
     <div className="returns-container">
@@ -356,17 +477,26 @@ function ReturnsChart({ data }: { data: CumulativeReturnsData }) {
           </div>
         ))}
       </div>
-      <div className="returns-chart" ref={containerRef}>
-        <canvas ref={canvasRef} style={{ width: '100%', height: '100%' }} />
+      <div className="returns-right">
+        <div className="analysis-date-controls">
+          <input type="date" className="date-input" value={startDate} min={dateBoundsMin} max={dateBoundsMax} onChange={e => setStartDate(e.target.value)} />
+          <span className="date-separator">to</span>
+          <input type="date" className="date-input" value={endDate} min={dateBoundsMin} max={dateBoundsMax} onChange={e => setEndDate(e.target.value)} />
+          <button className="control-btn" onClick={() => { setStartDate(defaultStart); setEndDate(defaultEnd) }}>Reset 1Y</button>
+          <button className="control-btn" onClick={() => { setStartDate(dateBoundsMin); setEndDate(dateBoundsMax) }}>All</button>
+        </div>
+        <div className="returns-chart" ref={containerRef}>
+          <canvas ref={canvasRef} style={{ width: '100%', height: '100%' }} />
+        </div>
       </div>
     </div>
   )
 }
 
-export function BasketSummary({ data, loading }: BasketSummaryProps) {
+export function BasketSummary({ data, loading, basketName, apiBase }: BasketSummaryProps) {
   const [tab, setTab] = useState<TabType>('breakout')
 
-  if (loading) return <div className="summary-panel"><div className="summary-loading">Loading summary...</div></div>
+  if (loading) return <div className="summary-panel"><div className="summary-loading">Loading basket analysis...</div></div>
   if (!data) return <div className="summary-panel"><div className="summary-empty">No summary data</div></div>
 
   const filterSignals = (key: 'breakout' | 'rotation' | 'btfd') =>
@@ -380,10 +510,10 @@ export function BasketSummary({ data, loading }: BasketSummaryProps) {
     <div className="summary-panel">
       <div className="summary-tabs">
         <button className={`summary-tab ${tab === 'breakout' ? 'active' : ''}`} onClick={() => setTab('breakout')}>
-          BO/BD ({breakoutSignals.length})
+          LT Trend ({breakoutSignals.length})
         </button>
         <button className={`summary-tab ${tab === 'rotation' ? 'active' : ''}`} onClick={() => setTab('rotation')}>
-          Rot ({rotationSignals.length})
+          ST Trend ({rotationSignals.length})
         </button>
         <button className={`summary-tab ${tab === 'btfd' ? 'active' : ''}`} onClick={() => setTab('btfd')}>
           BTFD/STFR ({btfdSignals.length})
@@ -399,7 +529,7 @@ export function BasketSummary({ data, loading }: BasketSummaryProps) {
         {tab === 'breakout' && <SignalsTable signals={breakoutSignals} />}
         {tab === 'rotation' && <SignalsTable signals={rotationSignals} />}
         {tab === 'btfd' && <SignalsTable signals={btfdSignals} />}
-        {tab === 'correlation' && <CorrelationHeatmap data={data.correlation} />}
+        {tab === 'correlation' && <CorrelationHeatmap data={data.correlation} basketName={basketName} apiBase={apiBase} />}
         {tab === 'returns' && <ReturnsChart data={data.cumulative_returns} />}
       </div>
     </div>

@@ -188,6 +188,71 @@ def get_meta_file_weights(basket_name):
         return {}
 
 
+def _get_universe_history(basket_name):
+    """Return the quarterly universe dict for a basket: {'2025 Q4': ['AAPL', ...], ...}"""
+    if GICS_MAPPINGS_FILE.exists():
+        with open(GICS_MAPPINGS_FILE, 'r') as f:
+            gics = json.load(f)
+        search_name = basket_name.replace("_", " ")
+        for group_key in ('sector_u', 'industry_u'):
+            group = gics.get(group_key, {})
+            if search_name in group:
+                return group[search_name]
+    if basket_name in THEMATIC_CONFIG:
+        fn, key = THEMATIC_CONFIG[basket_name]
+        p_path = THEMATIC_BASKET_CACHE / fn
+        if p_path.exists():
+            with open(p_path, 'r') as f:
+                data = json.load(f)
+            return data[key] if key is not None else data
+    return {}
+
+
+def _quarter_str_to_date(q_str):
+    """Convert '2025 Q4' to pd.Timestamp('2025-10-01')."""
+    parts = q_str.split()
+    year = int(parts[0])
+    qn = int(parts[1][1])
+    month = (qn - 1) * 3 + 1
+    return pd.Timestamp(year=year, month=month, day=1)
+
+
+def _get_ticker_join_dates(basket_name, tickers):
+    """Return dict of ticker -> pd.Timestamp for when each ticker first appeared in the basket."""
+    quarter_data = _get_universe_history(basket_name)
+    if not quarter_data:
+        return {}
+    ticker_set = set(tickers)
+    join_dates = {}
+    for q in sorted(quarter_data.keys()):
+        q_tickers = set(quarter_data[q])
+        for t in ticker_set:
+            if t in q_tickers and t not in join_dates:
+                join_dates[t] = _quarter_str_to_date(q)
+    return join_dates
+
+
+def _get_tickers_for_date(basket_name, target_date):
+    """Return the list of tickers that were in the basket at a given date."""
+    quarter_data = _get_universe_history(basket_name)
+    if not quarter_data:
+        return []
+    target_ts = pd.Timestamp(target_date)
+    # Find the quarter that contains this date (latest quarter start <= target_date)
+    best_q = None
+    best_ts = None
+    for q in sorted(quarter_data.keys()):
+        q_ts = _quarter_str_to_date(q)
+        if q_ts <= target_ts:
+            best_q = q
+            best_ts = q_ts
+    if best_q is None:
+        # Target is before any quarter — use earliest
+        qs = sorted(quarter_data.keys())
+        best_q = qs[0] if qs else None
+    return list(quarter_data[best_q]) if best_q else []
+
+
 def _quarter_start(ts):
     month = ((int(ts.month) - 1) // 3) * 3 + 1
     return pd.Timestamp(year=int(ts.year), month=month, day=1)
@@ -591,7 +656,8 @@ def get_basket_summary(basket_name: str):
             'Std_Dev', 'Historical_EV', 'EV_Last_3',
             'Risk_Adj_EV', 'Risk_Adj_EV_Last_3', 'Count',
         ]
-        cols_needed = ['Ticker', 'Date', 'Close']
+        cols_needed = ['Ticker', 'Date', 'Close', 'Trend', 'Is_Breakout_Sequence',
+                       'Resistance_Pivot', 'Support_Pivot', 'Upper_Target', 'Lower_Target']
         for st in SIGNAL_TYPES:
             cols_needed.append(SIGNAL_IS_COL[st])
             for suf in STAT_SUFFIXES:
@@ -618,49 +684,180 @@ def get_basket_summary(basket_name: str):
 
         latest = df.groupby('Ticker').tail(1)
 
+        # Exclude delisted tickers whose data ends before the most recent date
+        max_date = latest['Date'].max()
+        latest = latest[latest['Date'] >= max_date]
+
+        # Read live closes for intraday price updates
+        live_df = _read_live_parquet(LIVE_SIGNALS_FILE)
+        live_closes = {}
+        if live_df is not None:
+            for _, lr in live_df.iterrows():
+                t = lr.get('Ticker')
+                c = lr.get('Close')
+                if t and pd.notna(c):
+                    live_closes[t] = float(c)
+
         open_signals = []
         for _, row in latest.iterrows():
             ticker = row['Ticker']
-            for pi, (s1, s2) in enumerate(SIGNAL_PAIRS):
-                fired = last_fired.get((ticker, pi))
-                if fired is None:
-                    continue
+            hist_close = row['Close']
+
+            # --- Live state recomputation (same pivot logic as _compute_live_breadth) ---
+            if ticker in live_closes:
+                close = live_closes[ticker]
+                prev_res = row.get('Resistance_Pivot')
+                prev_sup = row.get('Support_Pivot')
+                prev_upper = row.get('Upper_Target')
+                prev_lower = row.get('Lower_Target')
+                is_up_rot = pd.notna(prev_res) and close > prev_res
+                is_down_rot = pd.notna(prev_sup) and close < prev_sup
+
+                if is_up_rot:
+                    live_trend = 1.0
+                elif is_down_rot:
+                    live_trend = 0.0
+                else:
+                    live_trend = row.get('Trend')
+
+                is_bo = is_up_rot and pd.notna(prev_upper) and close > prev_upper
+                is_bd = is_down_rot and pd.notna(prev_lower) and close < prev_lower
+                if is_bo:
+                    live_bos = True
+                elif is_bd:
+                    live_bos = False
+                else:
+                    live_bos = row.get('Is_Breakout_Sequence', False)
+            else:
+                close = hist_close
+                live_trend = row.get('Trend')
+                live_bos = row.get('Is_Breakout_Sequence', False)
+
+            # --- LT Trend (Breakout/Breakdown): always present for every ticker ---
+            bos = live_bos
+            lt_active = 'Breakout' if bos else 'Breakdown'
+            lt_is_live = bool(bos != row.get('Is_Breakout_Sequence', False)) and ticker in live_closes
+            lt_fired = last_fired.get((ticker, 0))
+            lt_entry_date = lt_fired[1] if lt_fired and lt_fired[0] == lt_active else None
+            lt_entry_price = row.get(f'{lt_active}_Entry_Price')
+            if pd.notna(lt_entry_price) and lt_entry_price:
+                lt_perf = ((lt_entry_price - close) / lt_entry_price if lt_active in SHORT_SIGNALS
+                           else (close - lt_entry_price) / lt_entry_price)
+            else:
+                lt_perf = None
+            lt_date_str = pd.Timestamp(lt_entry_date).strftime('%Y-%m-%d') if pd.notna(lt_entry_date) else None
+            open_signals.append({
+                'Ticker': ticker, 'Signal_Type': lt_active,
+                'Entry_Date': lt_date_str,
+                'Close': safe_float(close, 2),
+                'Entry_Price': safe_float(lt_entry_price, 2),
+                'Current_Performance': safe_float(lt_perf, 4),
+                'Win_Rate': safe_float(row.get(f'{lt_active}_Win_Rate')),
+                'Avg_Winner': safe_float(row.get(f'{lt_active}_Avg_Winner')),
+                'Avg_Loser': safe_float(row.get(f'{lt_active}_Avg_Loser')),
+                'Avg_Winner_Bars': safe_float(row.get(f'{lt_active}_Avg_Winner_Bars'), 1),
+                'Avg_Loser_Bars': safe_float(row.get(f'{lt_active}_Avg_Loser_Bars'), 1),
+                'Avg_MFE': safe_float(row.get(f'{lt_active}_Avg_MFE')),
+                'Avg_MAE': safe_float(row.get(f'{lt_active}_Avg_MAE')),
+                'Std_Dev': safe_float(row.get(f'{lt_active}_Std_Dev')),
+                'Historical_EV': safe_float(row.get(f'{lt_active}_Historical_EV')),
+                'EV_Last_3': safe_float(row.get(f'{lt_active}_EV_Last_3')),
+                'Risk_Adj_EV': safe_float(row.get(f'{lt_active}_Risk_Adj_EV')),
+                'Risk_Adj_EV_Last_3': safe_float(row.get(f'{lt_active}_Risk_Adj_EV_Last_3')),
+                'Count': safe_int(row.get(f'{lt_active}_Count')),
+                'Is_Live': lt_is_live,
+            })
+
+            # --- ST Trend (Up_Rot/Down_Rot): always present for every ticker ---
+            trend_val = live_trend
+            if pd.notna(trend_val):
+                st_active = 'Up_Rot' if trend_val == 1.0 else 'Down_Rot'
+            else:
+                st_active = 'Down_Rot'  # default to downtrend if unknown
+            hist_trend = row.get('Trend')
+            st_is_live = bool(
+                ticker in live_closes
+                and pd.notna(live_trend) and pd.notna(hist_trend)
+                and live_trend != hist_trend
+            )
+            st_fired = last_fired.get((ticker, 1))
+            st_entry_date = st_fired[1] if st_fired and st_fired[0] == st_active else None
+            st_entry_price = row.get(f'{st_active}_Entry_Price')
+            if pd.notna(st_entry_price) and st_entry_price:
+                st_perf = ((st_entry_price - close) / st_entry_price if st_active in SHORT_SIGNALS
+                           else (close - st_entry_price) / st_entry_price)
+            else:
+                st_perf = None
+            st_date_str = pd.Timestamp(st_entry_date).strftime('%Y-%m-%d') if pd.notna(st_entry_date) else None
+            open_signals.append({
+                'Ticker': ticker, 'Signal_Type': st_active,
+                'Entry_Date': st_date_str,
+                'Close': safe_float(close, 2),
+                'Entry_Price': safe_float(st_entry_price, 2),
+                'Current_Performance': safe_float(st_perf, 4),
+                'Win_Rate': safe_float(row.get(f'{st_active}_Win_Rate')),
+                'Avg_Winner': safe_float(row.get(f'{st_active}_Avg_Winner')),
+                'Avg_Loser': safe_float(row.get(f'{st_active}_Avg_Loser')),
+                'Avg_Winner_Bars': safe_float(row.get(f'{st_active}_Avg_Winner_Bars'), 1),
+                'Avg_Loser_Bars': safe_float(row.get(f'{st_active}_Avg_Loser_Bars'), 1),
+                'Avg_MFE': safe_float(row.get(f'{st_active}_Avg_MFE')),
+                'Avg_MAE': safe_float(row.get(f'{st_active}_Avg_MAE')),
+                'Std_Dev': safe_float(row.get(f'{st_active}_Std_Dev')),
+                'Historical_EV': safe_float(row.get(f'{st_active}_Historical_EV')),
+                'EV_Last_3': safe_float(row.get(f'{st_active}_EV_Last_3')),
+                'Risk_Adj_EV': safe_float(row.get(f'{st_active}_Risk_Adj_EV')),
+                'Risk_Adj_EV_Last_3': safe_float(row.get(f'{st_active}_Risk_Adj_EV_Last_3')),
+                'Count': safe_int(row.get(f'{st_active}_Count')),
+                'Is_Live': st_is_live,
+            })
+
+            # --- BTFD/STFR: only show open (unexited) signals ---
+            # Only flag live when live price crosses a target the historical close hadn't
+            btfd_is_live = False
+            if ticker in live_closes:
+                prev_lower = row.get('Lower_Target')
+                prev_upper = row.get('Upper_Target')
+                if pd.notna(prev_lower) and close < prev_lower and hist_close >= prev_lower:
+                    btfd_is_live = True
+                if pd.notna(prev_upper) and close > prev_upper and hist_close <= prev_upper:
+                    btfd_is_live = True
+
+            pi = 2
+            s1, s2 = SIGNAL_PAIRS[pi]
+            fired = last_fired.get((ticker, pi))
+            if fired is not None:
                 active, entry_date = fired
                 entry_col = f'{active}_Entry_Price'
                 exit_col = f'{active}_Exit_Date'
-                if entry_col not in row.index:
-                    continue
-                entry_price = row.get(entry_col)
-                exit_date = row.get(exit_col)
-                if pd.isna(entry_price) or pd.notna(exit_date):
-                    continue
-                close = row['Close']
-                if active in SHORT_SIGNALS:
-                    perf = (entry_price - close) / entry_price if entry_price else 0
-                else:
-                    perf = (close - entry_price) / entry_price if entry_price else 0
-                entry_date_str = pd.Timestamp(entry_date).strftime('%Y-%m-%d') if pd.notna(entry_date) else None
-                open_signals.append({
-                    'Ticker': ticker,
-                    'Signal_Type': active,
-                    'Entry_Date': entry_date_str,
-                    'Close': safe_float(close, 2),
-                    'Entry_Price': safe_float(entry_price, 2),
-                    'Current_Performance': safe_float(perf, 4),
-                    'Win_Rate': safe_float(row.get(f'{active}_Win_Rate')),
-                    'Avg_Winner': safe_float(row.get(f'{active}_Avg_Winner')),
-                    'Avg_Loser': safe_float(row.get(f'{active}_Avg_Loser')),
-                    'Avg_Winner_Bars': safe_float(row.get(f'{active}_Avg_Winner_Bars'), 1),
-                    'Avg_Loser_Bars': safe_float(row.get(f'{active}_Avg_Loser_Bars'), 1),
-                    'Avg_MFE': safe_float(row.get(f'{active}_Avg_MFE')),
-                    'Avg_MAE': safe_float(row.get(f'{active}_Avg_MAE')),
-                    'Std_Dev': safe_float(row.get(f'{active}_Std_Dev')),
-                    'Historical_EV': safe_float(row.get(f'{active}_Historical_EV')),
-                    'EV_Last_3': safe_float(row.get(f'{active}_EV_Last_3')),
-                    'Risk_Adj_EV': safe_float(row.get(f'{active}_Risk_Adj_EV')),
-                    'Risk_Adj_EV_Last_3': safe_float(row.get(f'{active}_Risk_Adj_EV_Last_3')),
-                    'Count': safe_int(row.get(f'{active}_Count')),
-                })
+                entry_price = row.get(entry_col) if entry_col in row.index else None
+                exit_date = row.get(exit_col) if exit_col in row.index else None
+                if pd.notna(entry_price) and pd.isna(exit_date):
+                    if active in SHORT_SIGNALS:
+                        perf = (entry_price - close) / entry_price if entry_price else 0
+                    else:
+                        perf = (close - entry_price) / entry_price if entry_price else 0
+                    entry_date_str = pd.Timestamp(entry_date).strftime('%Y-%m-%d') if pd.notna(entry_date) else None
+                    open_signals.append({
+                        'Ticker': ticker, 'Signal_Type': active,
+                        'Entry_Date': entry_date_str,
+                        'Close': safe_float(close, 2),
+                        'Entry_Price': safe_float(entry_price, 2),
+                        'Current_Performance': safe_float(perf, 4),
+                        'Win_Rate': safe_float(row.get(f'{active}_Win_Rate')),
+                        'Avg_Winner': safe_float(row.get(f'{active}_Avg_Winner')),
+                        'Avg_Loser': safe_float(row.get(f'{active}_Avg_Loser')),
+                        'Avg_Winner_Bars': safe_float(row.get(f'{active}_Avg_Winner_Bars'), 1),
+                        'Avg_Loser_Bars': safe_float(row.get(f'{active}_Avg_Loser_Bars'), 1),
+                        'Avg_MFE': safe_float(row.get(f'{active}_Avg_MFE')),
+                        'Avg_MAE': safe_float(row.get(f'{active}_Avg_MAE')),
+                        'Std_Dev': safe_float(row.get(f'{active}_Std_Dev')),
+                        'Historical_EV': safe_float(row.get(f'{active}_Historical_EV')),
+                        'EV_Last_3': safe_float(row.get(f'{active}_EV_Last_3')),
+                        'Risk_Adj_EV': safe_float(row.get(f'{active}_Risk_Adj_EV')),
+                        'Risk_Adj_EV_Last_3': safe_float(row.get(f'{active}_Risk_Adj_EV_Last_3')),
+                        'Count': safe_int(row.get(f'{active}_Count')),
+                        'Is_Live': btfd_is_live,
+                    })
         open_signals.sort(key=lambda x: x['Ticker'])
 
         # --- 21-Day Correlation ---
@@ -676,21 +873,32 @@ def get_basket_summary(basket_name: str):
         # Replace NaN with null for JSON
         corr_values = [[None if (v != v) else round(v, 3) for v in row] for row in corr_values]
 
-        # --- 1Y Cumulative Returns ---
-        one_year_ago = close_pivot.index.max() - pd.DateOffset(years=1)
-        yearly = close_pivot[close_pivot.index >= one_year_ago].sort_index()
-        # Rebase to first available price per ticker
-        if yearly.empty:
+        # --- Cumulative Returns (full range, rebased per ticker join date) ---
+        join_dates = _get_ticker_join_dates(basket_name, tickers)
+        close_sorted = close_pivot.sort_index()
+        if close_sorted.empty:
             dates = []
             cum_series = []
         else:
-            first_prices = yearly.bfill().iloc[0]
-            rebased = yearly.divide(first_prices.where(first_prices.notna()), axis='columns') - 1
-            dates = [d.strftime('%Y-%m-%d') for d in rebased.index]
+            dates = [d.strftime('%Y-%m-%d') for d in close_sorted.index]
             cum_series = []
-            for t in sorted(rebased.columns):
-                vals = [None if pd.isna(v) else round(float(v), 4) for v in rebased[t].tolist()]
-                cum_series.append({'ticker': t, 'values': vals})
+            for t in sorted(close_sorted.columns):
+                col = close_sorted[t]
+                jd = join_dates.get(t)
+                if jd:
+                    valid = col[col.index >= jd].dropna()
+                else:
+                    valid = col.dropna()
+                if valid.empty:
+                    vals = [None] * len(dates)
+                else:
+                    base_price = valid.iloc[0]
+                    rebased = col / base_price - 1
+                    if jd:
+                        rebased[rebased.index < jd] = float('nan')
+                    vals = [None if pd.isna(v) else round(float(v), 4) for v in rebased.tolist()]
+                jd_str = jd.strftime('%Y-%m-%d') if jd else None
+                cum_series.append({'ticker': t, 'values': vals, 'join_date': jd_str})
 
         return {
             'open_signals': open_signals,
@@ -702,6 +910,55 @@ def get_basket_summary(basket_name: str):
     except Exception as e:
         logger.error(f"Error in get_basket_summary for {basket_name}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/baskets/{basket_name}/correlation")
+def get_basket_correlation(basket_name: str, date: str = None):
+    """Return 21-day trailing correlation matrix for tickers in the basket at a given date."""
+    try:
+        if date:
+            target_date = pd.Timestamp(date)
+        else:
+            target_date = None
+
+        # Get tickers for the target date's quarter (or latest)
+        if target_date:
+            corr_tickers = _get_tickers_for_date(basket_name, target_date)
+        else:
+            corr_tickers = get_latest_universe_tickers(basket_name)
+            if not corr_tickers:
+                corr_tickers = get_meta_file_tickers(basket_name)
+        if not corr_tickers:
+            raise HTTPException(status_code=404, detail="No tickers found for basket")
+
+        close_df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=['Ticker', 'Date', 'Close'],
+                                   filters=[('Ticker', 'in', corr_tickers)])
+        close_pivot = close_df.pivot_table(index='Date', columns='Ticker', values='Close').sort_index()
+
+        if target_date:
+            close_pivot = close_pivot[close_pivot.index <= target_date]
+
+        returns = close_pivot.pct_change()
+        recent_returns = returns.tail(21)
+        valid_cols = [c for c in recent_returns.columns if recent_returns[c].notna().sum() >= 10]
+        corr_labels = sorted(valid_cols)
+        corr_matrix = recent_returns[corr_labels].corr()
+        corr_values = corr_matrix.values.tolist()
+        corr_values = [[None if (v != v) else round(v, 3) for v in row] for row in corr_values]
+
+        # Return available date range for the date picker
+        all_dates = [d.strftime('%Y-%m-%d') for d in close_pivot.index]
+        return {
+            'labels': corr_labels,
+            'matrix': corr_values,
+            'min_date': all_dates[0] if all_dates else None,
+            'max_date': all_dates[-1] if all_dates else None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in get_basket_correlation for {basket_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.websocket("/ws/live/{ticker}")
 async def websocket_endpoint(websocket: WebSocket, ticker: str):

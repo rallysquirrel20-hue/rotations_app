@@ -211,7 +211,7 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     seriesRefs.current.breakout = breakoutSeries;
 
     const corrSeries = cc.addLineSeries({ color: SOLAR_BASE01, lineWidth: 2, title: 'Correlation %' });
-    corrSeries.setData(sortedData.filter(d => d.Correlation_Pct != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Correlation_Pct) * 100 })));
+    corrSeries.setData(sortedData.filter(d => d.Correlation_Pct != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Correlation_Pct) })));
     seriesRefs.current.correlation = corrSeries;
 
     // Invisible alignment series: gives every indicator chart the full price-chart time scale
@@ -243,7 +243,7 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     seriesDataMaps['breakout'] = breakoutMap;
     // Correlation
     const corrMap = new Map<any, number>();
-    sortedData.forEach((d, i) => { if (d.Correlation_Pct != null) corrMap.set(times[i], Number(d.Correlation_Pct) * 100); });
+    sortedData.forEach((d, i) => { if (d.Correlation_Pct != null) corrMap.set(times[i], Number(d.Correlation_Pct)); });
     seriesDataMaps['correlation'] = corrMap;
 
     // Sync time scales and crosshairs across all charts

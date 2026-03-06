@@ -227,17 +227,6 @@ html, body, #root {
   overflow: hidden;
 }
 
-.summary-resizer {
-  height: 8px;
-  cursor: ns-resize;
-  background: var(--base01);
-  flex-shrink: 0;
-}
-
-.summary-resizer:hover {
-  background: var(--base00);
-}
-
 .tv-chart-wrapper {
   width: 100%;
   height: 100%;
@@ -303,7 +292,7 @@ html, body, #root {
 .summary-content {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
 }
@@ -333,9 +322,11 @@ html, body, #root {
   color: #ffffff !important;
 }
 
-/* Signals tab — horizontal scroll for wide table */
+/* Signals tab — scroll for wide/tall table */
 .summary-table-wrapper {
-  overflow-x: auto;
+  overflow: auto;
+  flex: 1;
+  min-height: 0;
 }
 
 /* Correlation tab — fit heatmap to available space */
@@ -346,10 +337,11 @@ html, body, #root {
   min-height: 0;
   align-items: center;
   justify-content: center;
+  overflow: hidden;
 }
 
 .corr-scroll {
-  overflow: auto;
+  overflow: hidden;
   max-width: 100%;
   max-height: 100%;
 }
@@ -373,6 +365,7 @@ html, body, #root {
   display: flex;
   flex-direction: row;
   min-height: 0;
+  overflow: hidden;
 }
 
 .returns-legend-left {
@@ -402,10 +395,41 @@ html, body, #root {
   opacity: 0.7;
 }
 
+.returns-right {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+
 .returns-chart {
   flex: 1;
   min-height: 0;
   min-width: 0;
+}
+
+/* Date controls bar for correlation and returns tabs */
+.analysis-date-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  background: var(--bg-sidebar);
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.analysis-date-label {
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--text-main);
+}
+
+.analysis-loading-hint {
+  font-size: 10px;
+  color: var(--base01);
+  font-style: italic;
 }
 
 .summary-th {
@@ -417,6 +441,14 @@ html, body, #root {
 
 .summary-table { width: 100%; border-collapse: collapse; }
 .summary-td { padding: 10px 12px; border-bottom: 1px solid var(--border-color); }
+.live-tag {
+  font-size: 9px;
+  margin-left: 4px;
+  padding: 1px 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.3);
+  vertical-align: middle;
+}
 
 /* Global Blocky style */
 * { border-radius: 0 !important; box-shadow: none !important; }
