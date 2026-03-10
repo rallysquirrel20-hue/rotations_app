@@ -1,5 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { createChart, ColorType, CrosshairMode, LineType, IChartApi, ISeriesApi } from 'lightweight-charts';
+import axios from 'axios';
 
 interface RangeTrigger {
   from?: string;
@@ -20,6 +21,10 @@ interface TVChartProps {
   exportTrigger?: number;
   symbolName?: string;
   layoutHeight?: number;
+  isBasketView?: boolean;
+  basketName?: string;
+  apiBase?: string;
+  showCandleDetail?: boolean;
 }
 
 const parseTime = (dateStr: string) => {
@@ -40,6 +45,19 @@ type PaneId = 'volume' | 'breadth' | 'breakout' | 'correlation';
 
 const DEFAULT_PANE_HEIGHT = 80;
 const MIN_PANE_HEIGHT = 40;
+
+interface CandleConstituent {
+  ticker: string;
+  weight: number;
+  daily_return: number;
+  contribution: number;
+}
+
+interface CandleDetail {
+  date: string;
+  constituents: CandleConstituent[];
+  basket_return?: number;
+}
 
 export const TVChart: React.FC<TVChartProps> = (props) => {
   const { data, showPivots, showTargets, showVolume, showBreadth, showBreakout, showCorrelation } = props;
@@ -64,6 +82,55 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
 
   const wrapperRef = useRef<HTMLDivElement>(null);
   const prevWrapperHeightRef = useRef<number | null>(null);
+
+  // Candle detail overlay for basket view
+  const [candleDetail, setCandleDetail] = useState<CandleDetail | null>(null);
+  const [pinnedDetail, setPinnedDetail] = useState<CandleDetail | null>(null);
+  const candleDetailCache = useRef<Map<string, CandleDetail>>(new Map());
+  const lastFetchedDate = useRef<string | null>(null);
+
+  // Build a time→date string lookup from data
+  const timeDateMap = useRef<Map<any, string>>(new Map());
+  useEffect(() => {
+    const map = new Map<any, string>();
+    const sortedData = [...data].sort((a, b) => String(a.Date).localeCompare(String(b.Date)));
+    sortedData.forEach(d => {
+      const t = parseTime(d.Date);
+      const dateStr = String(d.Date).slice(0, 10);
+      map.set(t, dateStr);
+    });
+    timeDateMap.current = map;
+  }, [data]);
+
+  // Escape key to unpin
+  useEffect(() => {
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setPinnedDetail(null);
+    };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, []);
+
+  const fetchCandleDetail = useCallback((dateStr: string) => {
+    if (!props.isBasketView || !props.basketName || !props.apiBase) return;
+    if (lastFetchedDate.current === dateStr) return;
+    lastFetchedDate.current = dateStr;
+
+    const cached = candleDetailCache.current.get(dateStr);
+    if (cached) {
+      setCandleDetail(cached);
+      return;
+    }
+
+    axios.get(`${props.apiBase}/baskets/${encodeURIComponent(props.basketName)}/candle-detail?date=${dateStr}`)
+      .then(res => {
+        candleDetailCache.current.set(dateStr, res.data);
+        if (lastFetchedDate.current === dateStr) {
+          setCandleDetail(res.data);
+        }
+      })
+      .catch(() => {});
+  }, [props.isBasketView, props.basketName, props.apiBase]);
 
   // dragging state: track which resizer is being dragged
   const dragging = useRef<{
@@ -285,11 +352,51 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
       });
     });
 
+    // Basket candle detail: fetch constituent data on price chart crosshair move
+    if (props.isBasketView && props.basketName && props.apiBase) {
+      // Hover: update detail only when not pinned
+      pc.subscribeCrosshairMove(p => {
+        if (pinnedDetail) return;
+        if (p.time) {
+          const dateStr = timeDateMap.current.get(p.time);
+          if (dateStr) fetchCandleDetail(dateStr);
+        } else {
+          setCandleDetail(null);
+          lastFetchedDate.current = null;
+        }
+      });
+      // Click: pin/unpin the current candle detail
+      pc.subscribeClick(p => {
+        if (p.time) {
+          const dateStr = timeDateMap.current.get(p.time);
+          if (dateStr) {
+            if (pinnedDetail && pinnedDetail.date === dateStr) {
+              setPinnedDetail(null);
+            } else {
+              const cached = candleDetailCache.current.get(dateStr);
+              if (cached) {
+                setPinnedDetail(cached);
+              } else {
+                fetchCandleDetail(dateStr);
+                // Pin once fetched — use a small delay for the async fetch
+                setTimeout(() => {
+                  const fetched = candleDetailCache.current.get(dateStr);
+                  if (fetched) setPinnedDetail(fetched);
+                }, 300);
+              }
+            }
+          }
+        } else {
+          setPinnedDetail(null);
+        }
+      });
+    }
+
     const initRange = { from: ohlc.length - 252, to: ohlc.length + 20 };
     chartEntries.forEach(([, c]) => c.timeScale().setVisibleLogicalRange(initRange));
 
     return () => chartEntries.forEach(([, c]) => c.remove());
-  }, [data, showPivots, showTargets]);
+  }, [data, showPivots, showTargets, props.isBasketView, props.basketName, props.apiBase, fetchCandleDetail, pinnedDetail]);
 
   // Resize charts whenever pane heights or visibility changes
   useEffect(() => {
@@ -366,7 +473,52 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     <div ref={wrapperRef} className="tv-chart-wrapper" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
 
       {/* Price pane: flex:1 takes all space not consumed by indicator panes */}
-      <div ref={pRef} style={{ flex: 1, minHeight: '100px' }} />
+      <div style={{ flex: 1, minHeight: '100px', position: 'relative' }}>
+        <div ref={pRef} style={{ width: '100%', height: '100%' }} />
+        {(() => {
+          if (!props.showCandleDetail) return null;
+          const detail = pinnedDetail || candleDetail;
+          if (!detail || !detail.constituents.length) return null;
+          return (
+            <div className="candle-detail-overlay" style={pinnedDetail ? { pointerEvents: 'auto', borderColor: 'rgb(50, 50, 255)' } : undefined}>
+              <div className="candle-detail-title">
+                {detail.date}
+                {pinnedDetail
+                  ? <span style={{ float: 'right', fontSize: '9px', color: 'rgb(50, 50, 255)', cursor: 'pointer' }} onClick={() => setPinnedDetail(null)}>PINNED (esc)</span>
+                  : <span style={{ float: 'right', fontSize: '9px', opacity: 0.5 }}>click to pin</span>}
+              </div>
+              <div className="candle-detail-row" style={{ fontWeight: 'bold', borderBottom: '1px solid #ccc', marginBottom: '2px', paddingBottom: '2px' }}>
+                <span className="ticker">Ticker</span>
+                <span className="weight">Weight</span>
+                <span className="ret">Return</span>
+                <span className="contrib">Contrib</span>
+              </div>
+              {detail.constituents.map(c => (
+                <div key={c.ticker} className="candle-detail-row">
+                  <span className="ticker">{c.ticker}</span>
+                  <span className="weight">{(c.weight * 100).toFixed(1)}%</span>
+                  <span className="ret" style={{ color: c.daily_return >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
+                    {(c.daily_return * 100).toFixed(2)}%
+                  </span>
+                  <span className="contrib" style={{ color: c.contribution >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
+                    {(c.contribution * 100).toFixed(3)}%
+                  </span>
+                </div>
+              ))}
+              {detail.basket_return !== undefined && (
+                <div className="candle-detail-row" style={{ borderTop: '1px solid #93a1a1', marginTop: '3px', paddingTop: '3px', fontWeight: 'bold' }}>
+                  <span className="ticker">Basket</span>
+                  <span className="weight"></span>
+                  <span className="ret"></span>
+                  <span className="contrib" style={{ color: detail.basket_return >= 0 ? 'rgb(50, 50, 255)' : 'rgb(255, 50, 150)' }}>
+                    {(detail.basket_return * 100).toFixed(3)}%
+                  </span>
+                </div>
+              )}
+            </div>
+          );
+        })()}
+      </div>
 
       {/* Unified pane loop — stable DOM identity regardless of visibility */}
       {allPanes.map((pane) => {

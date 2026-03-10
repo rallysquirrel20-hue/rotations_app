@@ -5,7 +5,6 @@ import numpy as np
 import os
 from pathlib import Path
 import json
-import pickle
 import databento as db
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
@@ -93,7 +92,13 @@ def _find_basket_parquet(slug):
     for folder in BASKET_CACHE_FOLDERS:
         if not folder.exists():
             continue
-        matches = list(folder.glob(f'{slug}_*_of_*_basket.parquet'))
+        # New naming: *_signals.parquet
+        matches = list(folder.glob(f'{slug}_*_of_*_signals.parquet'))
+        if not matches:
+            matches = list(folder.glob(f'{slug}_of_*_signals.parquet'))
+        # Legacy fallback: *_basket.parquet
+        if not matches:
+            matches = list(folder.glob(f'{slug}_*_of_*_basket.parquet'))
         if not matches:
             matches = list(folder.glob(f'{slug}_of_*_basket.parquet'))
         if matches:
@@ -105,7 +110,13 @@ def _find_basket_meta(slug):
     for folder in BASKET_CACHE_FOLDERS:
         if not folder.exists():
             continue
-        matches = list(folder.glob(f'{slug}_*_of_*_basket_meta.json'))
+        # New naming: *_signals_meta.json
+        matches = list(folder.glob(f'{slug}_*_of_*_signals_meta.json'))
+        if not matches:
+            matches = list(folder.glob(f'{slug}_of_*_signals_meta.json'))
+        # Legacy fallback: *_basket_meta.json
+        if not matches:
+            matches = list(folder.glob(f'{slug}_*_of_*_basket_meta.json'))
         if not matches:
             matches = list(folder.glob(f'{slug}_of_*_basket_meta.json'))
         if matches:
@@ -430,9 +441,9 @@ def list_baskets():
     for folder in BASKET_CACHE_FOLDERS:
         if not folder.exists():
             continue
-        for f in folder.glob("*_of_*_basket.parquet"):
+        for f in list(folder.glob("*_of_*_signals.parquet")) + list(folder.glob("*_of_*_basket.parquet")):
             name = f.stem
-            name = name.rsplit("_basket", 1)[0]
+            name = name.rsplit("_signals", 1)[0].rsplit("_basket", 1)[0]
             slug = re.sub(r'(_\d+)?_of_\d+$', '', name)
             if slug in t_names: cats["Themes"].append(slug)
             elif slug in s_names: cats["Sectors"].append(slug)
@@ -517,6 +528,94 @@ def list_tickers():
         return sorted(df['Ticker'].dropna().unique().tolist())
     except: raise HTTPException(status_code=500)
 
+@app.get("/api/live-signals")
+def list_live_signal_tickers():
+    """Return sorted list of tickers where a signal fires TODAY (recomputed with live prices)."""
+    if not INDIVIDUAL_SIGNALS_FILE.exists():
+        return []
+    try:
+        # Universe filter
+        universe = None
+        if TOP_500_FILE.exists():
+            try:
+                with open(TOP_500_FILE, 'r') as f:
+                    data = json.load(f)
+                    qs = sorted(data.keys())
+                    if qs:
+                        universe = set(data[qs[-1]])
+            except:
+                pass
+
+        # Only read columns needed by _build_signals_next_row (avoids loading 50+ unused columns)
+        _SIGNAL_COLS = [
+            'Ticker', 'Date', 'Close',
+            'RV_EMA', 'Trend', 'Resistance_Pivot', 'Support_Pivot',
+            'Rotation_ID', 'Up_Range_EMA', 'Down_Range_EMA', 'Up_Range', 'Down_Range',
+            'Rotation_Open', 'Upper_Target', 'Lower_Target',
+            'BTFD_Triggered', 'STFR_Triggered',
+            'Is_Breakout', 'Is_Breakdown', 'Is_Breakout_Sequence',
+        ]
+        cutoff = pd.Timestamp(datetime.now() - timedelta(days=14))
+        df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=_SIGNAL_COLS,
+                             filters=[('Date', '>=', cutoff)])
+        df = df.sort_values('Date')
+        latest = df.groupby('Ticker').tail(1)
+
+        # Exclude delisted tickers
+        max_date = latest['Date'].max()
+        latest = latest[latest['Date'] >= max_date]
+        if universe is not None:
+            latest = latest[latest['Ticker'].isin(universe)]
+
+        # Read live OHLC
+        live_df = _read_live_parquet(LIVE_SIGNALS_FILE)
+        if live_df is None or live_df.empty:
+            return []  # No live data → no live signals
+
+        live_ohlc = {}
+        for _, lr in live_df.iterrows():
+            t = lr.get('Ticker')
+            if t and pd.notna(lr.get('Close')):
+                live_ohlc[t] = {
+                    'Close': float(lr['Close']),
+                    'Open': float(lr['Open']) if pd.notna(lr.get('Open')) else None,
+                    'High': float(lr['High']) if pd.notna(lr.get('High')) else None,
+                    'Low': float(lr['Low']) if pd.notna(lr.get('Low')) else None,
+                }
+
+        now = datetime.now()
+
+        signal_flag_to_name = {
+            'Is_Up_Rotation': 'Up_Rot', 'Is_Down_Rotation': 'Down_Rot',
+            'Is_Breakout': 'Breakout', 'Is_Breakdown': 'Breakdown',
+            'Is_BTFD': 'BTFD', 'Is_STFR': 'STFR',
+        }
+
+        results = []
+        for _, row in latest.iterrows():
+            ticker = row['Ticker']
+            if ticker not in live_ohlc:
+                continue
+            ohlc = live_ohlc[ticker]
+            new_row = signals_engine._build_signals_next_row(
+                row, ohlc['Close'], now,
+                live_high=ohlc.get('High'),
+                live_low=ohlc.get('Low'),
+                live_open=ohlc.get('Open'),
+            )
+            if new_row is None:
+                continue
+            fired = [name for flag_col, name in signal_flag_to_name.items()
+                     if bool(new_row.get(flag_col, False))]
+            if fired:
+                results.append({"symbol": ticker, "signals": fired})
+
+        results.sort(key=lambda x: x["symbol"])
+        return results
+    except Exception as e:
+        logger.exception("live-signals failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/tickers/{ticker}")
 def get_ticker_data(ticker: str):
     if not INDIVIDUAL_SIGNALS_FILE.exists(): raise HTTPException(status_code=404)
@@ -551,70 +650,6 @@ def get_ticker_data(ticker: str):
         return {"chart_data": clean_data_for_json(df.sort_values('Date')), "tickers": []}
     except Exception: raise HTTPException(status_code=500)
 
-@app.get("/api/tickers/{ticker}/intraday")
-def get_intraday_data(ticker: str, response: Response, interval: str = "1m"):
-    # Force browser to never cache intraday data
-    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-
-    # Target the new Intraday_Data parquet files
-    intraday_file = BASE_DIR / "Intraday_Data" / f"{ticker}_1m.parquet"
-
-    try:
-        if not intraday_file.exists():
-            # Fallback to Databento API if parquet hasn't been built yet
-            if not db_client:
-                raise HTTPException(status_code=503, detail="Databento client not configured and parquet not found")
-
-            fetch_interval = "1m" if interval in ["5m", "30m"] else interval
-            schema = f"ohlcv-{fetch_interval}"
-            start = (datetime.now() - timedelta(days=4)).strftime("%Y-%m-%d")
-            data = db_client.timeseries.get_range(
-                dataset=DB_DATASET, symbols=ticker, schema=schema, start=start, stype_in=DB_STYPE_IN
-            )
-            df = data.to_df()
-            if df.empty: return {"chart_data": []}
-
-            # Standardize column names
-            rename_map = {'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}
-            df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-
-            # Convert to NY and Filter RTH
-            df.index = df.index.tz_convert('America/New_York')
-            df = df.between_time('09:30', '15:59')
-        else:
-            # Parquet flow
-            df = pd.read_parquet(intraday_file)
-            df['Date'] = pd.to_datetime(df['Date'])
-            df.index = df['Date']
-
-            # Convert to NY and Filter RTH
-            df.index = df.index.tz_convert('America/New_York')
-            df = df.between_time('09:30', '15:59')
-
-        # Resample logic (applies to both fallback and parquet)
-        if interval in ["5m", "30m"]:
-            resample_rule = '5min' if interval == "5m" else '30min'
-            # Resample OHLCV
-            df = df.resample(resample_rule).agg({
-                'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
-            }).dropna().reset_index()
-            # Recalculate signals for the specific timeframe
-            df = signals_engine._build_signals_from_df(df, ticker)
-        elif 'Resistance_Pivot' not in df.columns:
-            # Recalculate signals for 1m if not present (likely API fallback)
-            df = signals_engine._build_signals_from_df(df.reset_index(), ticker)
-
-        # Limit rows strictly to prevent lightweight-charts from crashing the browser
-        df = df.tail(5000).copy()
-
-        # Format as Nominal Local Time (No Z)
-        if 'Date' not in df.columns: df = df.reset_index()
-        df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%dT%H:%M:%S')
-
-        return {"chart_data": clean_data_for_json(df.sort_values('Date'))}
-    except Exception as e:
-        logger.error(f"Error in get_intraday_data for {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 SIGNAL_TYPES = ['Breakout', 'Breakdown', 'Up_Rot', 'Down_Rot', 'BTFD', 'STFR']
 SIGNAL_PAIRS = [('Breakout', 'Breakdown'), ('Up_Rot', 'Down_Rot'), ('BTFD', 'STFR')]
@@ -873,32 +908,53 @@ def get_basket_summary(basket_name: str):
         # Replace NaN with null for JSON
         corr_values = [[None if (v != v) else round(v, 3) for v in row] for row in corr_values]
 
-        # --- Cumulative Returns (full range, rebased per ticker join date) ---
-        join_dates = _get_ticker_join_dates(basket_name, tickers)
-        close_sorted = close_pivot.sort_index()
-        if close_sorted.empty:
-            dates = []
+        # --- Cumulative Returns (respects active basket membership via contributions) ---
+        contrib_file = _find_basket_contributions(basket_name)
+        if contrib_file:
+            cdf = pd.read_parquet(contrib_file)
+            cdf['Date'] = pd.to_datetime(cdf['Date']).dt.normalize()
+            cdf = cdf.drop_duplicates(subset=['Date', 'Ticker'], keep='last')
+            ret_pivot = cdf.pivot_table(index='Date', columns='Ticker', values='Daily_Return')
+            ret_pivot = ret_pivot.sort_index()
+            active_mask = ret_pivot.notna()
+            # Fill inactive days with 0% return (factor=1) so cumprod passes through
+            factors = ret_pivot.fillna(0) + 1
+            equity = factors.cumprod()
+            cum_ret = equity - 1
+            # Mask inactive days back to NaN
+            cum_ret[~active_mask] = float('nan')
+            dates = [d.strftime('%Y-%m-%d') for d in ret_pivot.index]
             cum_series = []
+            for t in sorted(ret_pivot.columns):
+                vals = [None if pd.isna(v) else round(float(v), 4) for v in cum_ret[t].tolist()]
+                cum_series.append({'ticker': t, 'values': vals, 'join_date': None})
         else:
-            dates = [d.strftime('%Y-%m-%d') for d in close_sorted.index]
-            cum_series = []
-            for t in sorted(close_sorted.columns):
-                col = close_sorted[t]
-                jd = join_dates.get(t)
-                if jd:
-                    valid = col[col.index >= jd].dropna()
-                else:
-                    valid = col.dropna()
-                if valid.empty:
-                    vals = [None] * len(dates)
-                else:
-                    base_price = valid.iloc[0]
-                    rebased = col / base_price - 1
+            # Fallback: use close prices and join dates (no contributions file)
+            join_dates = _get_ticker_join_dates(basket_name, tickers)
+            close_sorted = close_pivot.sort_index()
+            if close_sorted.empty:
+                dates = []
+                cum_series = []
+            else:
+                dates = [d.strftime('%Y-%m-%d') for d in close_sorted.index]
+                cum_series = []
+                for t in sorted(close_sorted.columns):
+                    col = close_sorted[t]
+                    jd = join_dates.get(t)
                     if jd:
-                        rebased[rebased.index < jd] = float('nan')
-                    vals = [None if pd.isna(v) else round(float(v), 4) for v in rebased.tolist()]
-                jd_str = jd.strftime('%Y-%m-%d') if jd else None
-                cum_series.append({'ticker': t, 'values': vals, 'join_date': jd_str})
+                        valid = col[col.index >= jd].dropna()
+                    else:
+                        valid = col.dropna()
+                    if valid.empty:
+                        vals = [None] * len(dates)
+                    else:
+                        base_price = valid.iloc[0]
+                        rebased = col / base_price - 1
+                        if jd:
+                            rebased[rebased.index < jd] = float('nan')
+                        vals = [None if pd.isna(v) else round(float(v), 4) for v in rebased.tolist()]
+                    jd_str = jd.strftime('%Y-%m-%d') if jd else None
+                    cum_series.append({'ticker': t, 'values': vals, 'join_date': jd_str})
 
         return {
             'open_signals': open_signals,
@@ -957,6 +1013,153 @@ def get_basket_correlation(basket_name: str, date: str = None):
         raise
     except Exception as e:
         logger.error(f"Error in get_basket_correlation for {basket_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _find_basket_contributions(slug):
+    """Glob for a basket contributions parquet by slug prefix across basket cache folders."""
+    for folder in BASKET_CACHE_FOLDERS:
+        if not folder.exists():
+            continue
+        matches = list(folder.glob(f'{slug}_*_of_*_contributions.parquet'))
+        if not matches:
+            matches = list(folder.glob(f'{slug}_of_*_contributions.parquet'))
+        if matches:
+            return matches[0]
+    return None
+
+
+@app.get("/api/baskets/{basket_name}/contributions")
+def get_basket_contributions(basket_name: str, start: str = None, end: str = None):
+    """Return per-constituent contribution data for a date range."""
+    try:
+        contrib_file = _find_basket_contributions(basket_name)
+        if not contrib_file:
+            raise HTTPException(status_code=404, detail=f"Contributions file not found for {basket_name}")
+
+        df = pd.read_parquet(contrib_file)
+        df['Date'] = pd.to_datetime(df['Date']).dt.normalize()
+
+        # Per-ticker metadata from full dataset (before date filtering)
+        full_max_date = df['Date'].max()
+        ticker_meta = df.groupby('Ticker').agg(
+            first_date=('Date', 'min'),
+            last_date=('Date', 'max'),
+        ).reset_index()
+        # Current weight: Weight_BOD on the dataset max date (null if ticker exited)
+        max_day = df[df['Date'] == full_max_date][['Ticker', 'Weight_BOD']].rename(
+            columns={'Weight_BOD': 'current_weight'}
+        )
+        ticker_meta = ticker_meta.merge(max_day, on='Ticker', how='left')
+
+        # Full date range (for the date picker)
+        full_min_str = df['Date'].min().strftime('%Y-%m-%d')
+        full_max_str = full_max_date.strftime('%Y-%m-%d')
+
+        # Apply date filtering
+        if start:
+            df = df[df['Date'] >= pd.Timestamp(start)]
+        if end:
+            df = df[df['Date'] <= pd.Timestamp(end)]
+
+        if df.empty:
+            return {
+                "tickers": [], "dates": [], "total_contributions": [],
+                "initial_weights": [], "final_weights": [],
+                "first_dates": [], "last_dates": [], "current_weights": [],
+                "equity_dates": [], "equity_values": [],
+                "date_range": {"min": full_min_str, "max": full_max_str},
+            }
+
+        # Equity curve: daily basket return then cumulative product
+        daily_return = df.groupby('Date')['Contribution'].sum().sort_index()
+        equity = (1 + daily_return).cumprod()
+        equity_dates = [d.strftime('%Y-%m-%d') for d in equity.index]
+        equity_values = equity.tolist()
+
+        # Aggregate per-ticker over the period
+        agg = df.groupby('Ticker').agg(
+            total_contribution=('Contribution', 'sum'),
+            initial_weight=('Weight_BOD', 'first'),
+            final_weight=('Weight_BOD', 'last'),
+        ).reset_index()
+
+        # Sort worst to best
+        agg = agg.sort_values('total_contribution').reset_index(drop=True)
+
+        # Merge ticker metadata so arrays align with tickers[]
+        agg = agg.merge(ticker_meta, on='Ticker', how='left')
+
+        # Date range info
+        all_dates = sorted(df['Date'].unique())
+        date_strs = [d.strftime('%Y-%m-%d') for d in all_dates]
+
+        return {
+            "tickers": agg['Ticker'].tolist(),
+            "total_contributions": agg['total_contribution'].tolist(),
+            "initial_weights": agg['initial_weight'].tolist(),
+            "final_weights": agg['final_weight'].tolist(),
+            "first_dates": [d.strftime('%Y-%m-%d') for d in agg['first_date']],
+            "last_dates": [d.strftime('%Y-%m-%d') for d in agg['last_date']],
+            "current_weights": [None if pd.isna(w) else float(w) for w in agg['current_weight']],
+            "equity_dates": equity_dates,
+            "equity_values": equity_values,
+            "dates": date_strs,
+            "date_range": {
+                "min": full_min_str,
+                "max": full_max_str,
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in get_basket_contributions for {basket_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/baskets/{basket_name}/candle-detail")
+def get_basket_candle_detail(basket_name: str, date: str = None):
+    """Return per-constituent weights, returns, and contributions for a single day."""
+    try:
+        contrib_file = _find_basket_contributions(basket_name)
+        if not contrib_file:
+            raise HTTPException(status_code=404, detail=f"Contributions file not found for {basket_name}")
+
+        df = pd.read_parquet(contrib_file)
+        df['Date'] = pd.to_datetime(df['Date']).dt.normalize()
+
+        if date:
+            target = pd.Timestamp(date).normalize()
+        else:
+            target = df['Date'].max()
+
+        day = df[df['Date'] == target]
+        if day.empty:
+            return {"date": target.strftime('%Y-%m-%d'), "constituents": []}
+
+        # Sort by contribution descending
+        day = day.sort_values('Contribution', ascending=False)
+
+        constituents = []
+        for _, row in day.iterrows():
+            constituents.append({
+                "ticker": row['Ticker'],
+                "weight": round(float(row['Weight_BOD']), 6),
+                "daily_return": round(float(row['Daily_Return']), 6),
+                "contribution": round(float(row['Contribution']), 6),
+            })
+
+        basket_return = float(day['Contribution'].sum())
+
+        return {
+            "date": target.strftime('%Y-%m-%d'),
+            "constituents": constituents,
+            "basket_return": round(basket_return, 6),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in get_basket_candle_detail for {basket_name}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

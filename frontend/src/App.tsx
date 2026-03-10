@@ -31,6 +31,7 @@ class ErrorBoundary extends Component<{children: ReactNode}, {hasError: boolean,
 
 interface BasketsData { Themes: string[]; Sectors: string[]; Industries: string[]; }
 interface TickerWeight { symbol: string; weight: number; }
+interface LiveSignalTicker { symbol: string; signals: string[]; }
 interface OpenSignal {
   Ticker: string
   Signal_Type: string
@@ -57,14 +58,16 @@ interface BasketSummaryData {
   correlation: CorrelationData
   cumulative_returns: CumulativeReturnsData
 }
-type ViewType = 'Themes' | 'Sectors' | 'Industries' | 'Tickers';
-type Timeframe = 'Daily' | '1m' | '5m' | '30m';
+type ViewType = 'Themes' | 'Sectors' | 'Industries' | 'Tickers' | 'LiveSignals';
 
 function App() {
   const [baskets, setBaskets] = useState<BasketsData>({ Themes: [], Sectors: [], Industries: [] })
   const [tickers, setTickers] = useState<string[]>([])
+  const [liveSignalTickers, setLiveSignalTickers] = useState<LiveSignalTicker[]>([])
+  const [liveSignalFilter, setLiveSignalFilter] = useState<string | null>(null)
+  const [liveSignalSort, setLiveSignalSort] = useState<'ticker' | 'signal'>('signal')
   const [viewType, setViewType] = useState<ViewType>('Themes')
-  const [timeframe, setTimeframe] = useState<Timeframe>('Daily')
+
   const [selectedItem, setSelectedItem] = useState<string>('')
   const [activeTicker, setActiveTicker] = useState<string | null>(null)
   const [chartData, setChartData] = useState<any[]>([])
@@ -77,6 +80,7 @@ function App() {
   const [showBreadth, setShowBreadth] = useState(true)
   const [showBreakout, setShowBreakout] = useState(true)
   const [showCorrelation, setShowCorrelation] = useState(true)
+  const [showCandleDetail, setShowCandleDetail] = useState(true)
   const [startDate, setStartDate] = useState('')
   const [endDate, setEndDate] = useState('')
   const [rangeUpdateTrigger, setRangeUpdateTrigger] = useState<{from?: string, to?: string, reset1Y?: boolean} | null>(null)
@@ -86,8 +90,28 @@ function App() {
   const [summaryLoading, setSummaryLoading] = useState(false)
   const contentStackRef = useRef<HTMLDivElement>(null)
 
-  const isBasketView = viewType !== 'Tickers' && !activeTicker
-  const canShowSummary = isBasketView && timeframe === 'Daily'
+  const isTicker = viewType === 'Tickers' || viewType === 'LiveSignals'
+  const isBasketView = !isTicker && !activeTicker
+  const canShowSummary = isBasketView
+
+  const ALL_SIGNAL_TYPES = ['Breakout', 'Up_Rot', 'BTFD', 'STFR', 'Down_Rot', 'Breakdown']
+
+  const filteredLiveSignals = useMemo(() => {
+    let list = liveSignalTickers
+    if (liveSignalFilter) {
+      list = list.filter(t => t.signals.includes(liveSignalFilter))
+    }
+    if (liveSignalSort === 'signal') {
+      const order: Record<string, number> = {}
+      ALL_SIGNAL_TYPES.forEach((s, i) => order[s] = i)
+      list = [...list].sort((a, b) => {
+        const aMin = Math.min(...a.signals.map(s => order[s] ?? 99))
+        const bMin = Math.min(...b.signals.map(s => order[s] ?? 99))
+        return aMin !== bMin ? aMin - bMin : a.symbol.localeCompare(b.symbol)
+      })
+    }
+    return list
+  }, [liveSignalTickers, liveSignalFilter, liveSignalSort])
 
   // Derive min/max dates from loaded chart data for date picker bounds
   const dateBounds = useMemo(() => {
@@ -102,21 +126,22 @@ function App() {
       if (res.data.Themes?.length > 0) setSelectedItem(res.data.Themes[0]);
     }).catch(err => console.error(err));
     axios.get(`${API_BASE}/tickers`).then(res => setTickers(res.data)).catch(err => console.error(err));
+    axios.get(`${API_BASE}/live-signals`).then(res => setLiveSignalTickers(res.data)).catch(err => console.error(err));
   }, [])
 
   useEffect(() => {
-    if (!selectedItem) return;
+    if (!selectedItem) {
+      setChartData([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setLiveUpdate(null); // Clear previous live updates
-    const isViewingBasketConstituent = activeTicker && viewType !== 'Tickers';
+    const isViewingBasketConstituent = activeTicker && !isTicker;
     const targetItem = isViewingBasketConstituent ? activeTicker : selectedItem;
+
+    let endpoint = (isTicker || isViewingBasketConstituent) ? `tickers/${encodeURIComponent(targetItem as string)}` : `baskets/${encodeURIComponent(targetItem as string)}`;
     
-    let endpoint = (viewType === 'Tickers' || isViewingBasketConstituent) ? `tickers/${encodeURIComponent(targetItem as string)}` : `baskets/${encodeURIComponent(targetItem as string)}`;
-    
-    // Use intraday endpoint if timeframe is not Daily
-    if (timeframe !== 'Daily' && (viewType === 'Tickers' || isViewingBasketConstituent)) {
-      endpoint = `tickers/${encodeURIComponent(targetItem as string)}/intraday?interval=${timeframe}`;
-    }
 
     axios.get(`${API_BASE}/${endpoint}`).then(res => {
       setChartData(res.data.chart_data);
@@ -132,7 +157,7 @@ function App() {
     let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
     let cancelled = false;
 
-    if (viewType === 'Tickers' || isViewingBasketConstituent) {
+    if ((isTicker || isViewingBasketConstituent) && targetItem) {
       const wsUrl = `ws://${API_HOSTNAME}:8000/ws/live/${encodeURIComponent(targetItem as string)}`;
 
       const connect = () => {
@@ -158,7 +183,7 @@ function App() {
       if (reconnectTimeout) clearTimeout(reconnectTimeout);
       if (ws) ws.close();
     };
-  }, [selectedItem, viewType, activeTicker, timeframe])
+  }, [selectedItem, viewType, activeTicker])
 
   useEffect(() => {
     if (!canShowSummary) {
@@ -188,20 +213,32 @@ function App() {
     }
   }, [canShowSummary, selectedItem, showSummary])
 
+  // Auto-select first live signal ticker once data arrives
+  useEffect(() => {
+    if (viewType === 'LiveSignals' && liveSignalTickers.length > 0 && !selectedItem) {
+      setSelectedItem(liveSignalTickers[0].symbol);
+    }
+  }, [liveSignalTickers, viewType, selectedItem])
+
   const handleViewTypeChange = (type: ViewType) => {
-    setViewType(type); setActiveTicker(null); setTimeframe('Daily'); setShowSummary(false); setSummaryData(null)
+    setViewType(type); setActiveTicker(null); setShowSummary(false); setSummaryData(null)
     if (type === 'Themes' && baskets.Themes.length > 0) setSelectedItem(baskets.Themes[0]);
     else if (type === 'Sectors' && baskets.Sectors.length > 0) setSelectedItem(baskets.Sectors[0]);
     else if (type === 'Industries' && baskets.Industries.length > 0) setSelectedItem(baskets.Industries[0]);
     else if (type === 'Tickers' && tickers.length > 0) setSelectedItem(tickers[0]);
+    else if (type === 'LiveSignals') {
+      if (liveSignalTickers.length > 0) setSelectedItem(liveSignalTickers[0].symbol);
+      else setSelectedItem('');  // Clear stale selection while data loads
+    }
   }
 
-  const getItemsForView = () => {
+  const getItemsForView = (): string[] => {
     switch(viewType) {
       case 'Themes': return baskets.Themes;
       case 'Sectors': return baskets.Sectors;
       case 'Industries': return baskets.Industries;
       case 'Tickers': return tickers;
+      case 'LiveSignals': return filteredLiveSignals.map(t => t.symbol);
       default: return [];
     }
   }
@@ -217,18 +254,48 @@ function App() {
               <button className={viewType === 'Sectors' ? 'active' : ''} onClick={() => handleViewTypeChange('Sectors')}>Sectors</button>
               <button className={viewType === 'Industries' ? 'active' : ''} onClick={() => handleViewTypeChange('Industries')}>Industries</button>
               <button className={viewType === 'Tickers' ? 'active' : ''} onClick={() => handleViewTypeChange('Tickers')}>Tickers</button>
+              <button className={viewType === 'LiveSignals' ? 'active' : ''} onClick={() => handleViewTypeChange('LiveSignals')}>Live Signals</button>
             </div>
           </div>
           <div className="sidebar-scrollable-content">
+            {viewType === 'LiveSignals' && (
+              <div className="signal-filter-bar">
+                <button className={`signal-filter-btn ${liveSignalFilter === null ? 'active' : ''}`}
+                        onClick={() => setLiveSignalFilter(null)}>All</button>
+                {ALL_SIGNAL_TYPES.map(s => (
+                  <button key={s} className={`signal-filter-btn ${liveSignalFilter === s ? 'active' : ''}`}
+                          onClick={() => setLiveSignalFilter(prev => prev === s ? null : s)}>{s.replace(/_/g, ' ')}</button>
+                ))}
+                <button className="signal-sort-btn"
+                        onClick={() => setLiveSignalSort(prev => prev === 'ticker' ? 'signal' : 'ticker')}
+                        title={`Sort by ${liveSignalSort === 'ticker' ? 'signal' : 'ticker'}`}>
+                  {liveSignalSort === 'ticker' ? 'A-Z' : 'Sig'}
+                </button>
+              </div>
+            )}
             <ul className="sidebar-list">
-              {getItemsForView().map(item => (
-                <li key={item} className={`sidebar-item ${selectedItem === item && !activeTicker ? 'active' : ''}`}
-                    onClick={() => { setSelectedItem(item); setActiveTicker(null); setSummaryData(null); }}>
-                  {item.replace(/_/g, ' ')}
-                </li>
-              ))}
+              {viewType === 'LiveSignals' ? (
+                filteredLiveSignals.length === 0 ? (
+                  <li className="sidebar-item" style={{color: 'var(--text-muted)', fontStyle: 'italic'}}>
+                    {liveSignalTickers.length === 0 ? 'No live signals available' : 'No matches for filter'}
+                  </li>
+                ) : filteredLiveSignals.map(t => (
+                  <li key={t.symbol} className={`sidebar-item composition-item ${selectedItem === t.symbol && !activeTicker ? 'active' : ''}`}
+                      onClick={() => { setSelectedItem(t.symbol); setActiveTicker(null); setSummaryData(null); }}>
+                    <span className="ticker-symbol">{t.symbol}</span>
+                    <span className="signal-tags">{t.signals.join(', ').replace(/_/g, ' ')}</span>
+                  </li>
+                ))
+              ) : (
+                getItemsForView().map(item => (
+                  <li key={item} className={`sidebar-item ${selectedItem === item && !activeTicker ? 'active' : ''}`}
+                      onClick={() => { setSelectedItem(item); setActiveTicker(null); setSummaryData(null); }}>
+                    {item.replace(/_/g, ' ')}
+                  </li>
+                ))
+              )}
             </ul>
-            {viewType !== 'Tickers' && composition.length > 0 && (
+            {!isTicker && composition.length > 0 && (
               <div className="sidebar-composition-section">
                 <h3 className="sidebar-group-title">Composition ({selectedItem.replace(/_/g, ' ')})</h3>
                 <ul className="sidebar-list">
@@ -248,15 +315,22 @@ function App() {
           {loading && <div className="loading-overlay"><span className="loading-text">Loading...</span></div>}
           <div className="main-header">
             <h2 className="main-title">{activeTicker || selectedItem.replace(/_/g, ' ')}</h2>
-            <div className="header-controls">
-              {(viewType === 'Tickers' || activeTicker) && (
-                <div className="timeframe-selector" style={{ marginRight: '15px' }}>
-                  <button className={`control-btn ${timeframe === 'Daily' ? 'primary' : ''}`} onClick={() => setTimeframe('Daily')}>Daily</button>
-                  <button className={`control-btn ${timeframe === '1m' ? 'primary' : ''}`} onClick={() => setTimeframe('1m')}>1m</button>
-                  <button className={`control-btn ${timeframe === '5m' ? 'primary' : ''}`} onClick={() => setTimeframe('5m')}>5m</button>
-                  <button className={`control-btn ${timeframe === '30m' ? 'primary' : ''}`} onClick={() => setTimeframe('30m')}>30m</button>
-                </div>
+            <div className="header-toggles">
+              <label className="overlay-checkbox"><input type="checkbox" checked={showPivots} onChange={e => setShowPivots(e.target.checked)} /> Pivots</label>
+              <label className="overlay-checkbox"><input type="checkbox" checked={showTargets} onChange={e => setShowTargets(e.target.checked)} /> Targets</label>
+              {!isBasketView && (
+                <label className="overlay-checkbox"><input type="checkbox" checked={showVolume} onChange={e => setShowVolume(e.target.checked)} /> Volume</label>
               )}
+              {isBasketView && (
+                <>
+                  <label className="overlay-checkbox"><input type="checkbox" checked={showBreadth} onChange={e => setShowBreadth(e.target.checked)} /> Breadth%</label>
+                  <label className="overlay-checkbox"><input type="checkbox" checked={showBreakout} onChange={e => setShowBreakout(e.target.checked)} /> Breakout%</label>
+                  <label className="overlay-checkbox"><input type="checkbox" checked={showCorrelation} onChange={e => setShowCorrelation(e.target.checked)} /> Correlation%</label>
+                  <label className="overlay-checkbox"><input type="checkbox" checked={showCandleDetail} onChange={e => setShowCandleDetail(e.target.checked)} /> Constituents</label>
+                </>
+              )}
+            </div>
+            <div className="header-controls">
               <div className="date-range-group">
                 <input type="date" className="date-input" value={startDate} min={dateBounds.min} max={dateBounds.max} onChange={e => setStartDate(e.target.value)} />
                 <span className="date-separator">to</span>
@@ -280,23 +354,9 @@ function App() {
               <BasketSummary data={summaryData} loading={summaryLoading} basketName={selectedItem} apiBase={API_BASE} />
             ) : (
             <div className="chart-container">
-            <div className="chart-overlay-toggles">
-              <label className="overlay-checkbox"><input type="checkbox" checked={showPivots} onChange={e => setShowPivots(e.target.checked)} /> Pivots</label>
-              <label className="overlay-checkbox"><input type="checkbox" checked={showTargets} onChange={e => setShowTargets(e.target.checked)} /> Targets</label>
-              {!isBasketView && (
-                <label className="overlay-checkbox"><input type="checkbox" checked={showVolume} onChange={e => setShowVolume(e.target.checked)} /> Volume</label>
-              )}
-              {isBasketView && (
-                <>
-                  <label className="overlay-checkbox"><input type="checkbox" checked={showBreadth} onChange={e => setShowBreadth(e.target.checked)} /> Breadth%</label>
-                  <label className="overlay-checkbox"><input type="checkbox" checked={showBreakout} onChange={e => setShowBreakout(e.target.checked)} /> Breakout%</label>
-                  <label className="overlay-checkbox"><input type="checkbox" checked={showCorrelation} onChange={e => setShowCorrelation(e.target.checked)} /> Correlation%</label>
-                </>
-              )}
-            </div>
             {chartData && chartData.length > 0 ? (
               <TVChart
-                key={`${viewType}_${activeTicker || selectedItem}_${timeframe}`}
+                key={`${viewType}_${activeTicker || selectedItem}`}
                 data={chartData}
                 liveUpdate={liveUpdate}
                 showPivots={showPivots}
@@ -308,6 +368,10 @@ function App() {
                 rangeUpdateTrigger={rangeUpdateTrigger}
                 exportTrigger={exportTrigger}
                 symbolName={activeTicker || selectedItem}
+                isBasketView={isBasketView}
+                basketName={isBasketView ? selectedItem : undefined}
+                apiBase={API_BASE}
+                showCandleDetail={showCandleDetail && isBasketView}
               />
             ) : (
               <div className="no-data">{selectedItem ? "No data found" : "Select an item"}</div>

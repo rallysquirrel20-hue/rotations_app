@@ -10,7 +10,7 @@ Full-stack financial analysis dashboard for visualizing stock rotation signals, 
 
 - **Backend:** FastAPI (Python), Pandas, NumPy, Databento API
 - **Frontend:** React 18 + TypeScript, Vite, lightweight-charts (TradingView), Axios
-- **Data:** Parquet/Pickle caches from `rotations_signals`, Databento for live/intraday
+- **Data:** Parquet/JSON caches from `rotations_signals`, Databento for live data
 
 ## Commands
 
@@ -61,7 +61,6 @@ API endpoints:
 - `GET /api/baskets/{name}/summary` — Open signals, 21-day correlation matrix, 1-year cumulative returns
 - `GET /api/tickers` — Lists all 500 tickers
 - `GET /api/tickers/{ticker}` — Daily OHLCV with optional live Databento merge
-- `GET /api/tickers/{ticker}/intraday?interval={1m|5m|30m}` — Intraday bars (RTH only, max 5000 rows)
 - `WebSocket /ws/live/{ticker}` — Real-time 1-minute bars from Databento Live API
 
 Data sources (read from `PYTHON_OUTPUTS_DIR`):
@@ -72,17 +71,17 @@ Data sources (read from `PYTHON_OUTPUTS_DIR`):
 - `Data_Storage/gics_mappings_500.json` — Sector/industry ticker mappings
 - `Data_Storage/top500stocks.json` — Quarterly universe
 
-**`signals_engine.py`** — Intraday signal calculation engine. Fetches 1-minute bars from Databento, resamples to 30-minute, and runs the same 3-phase rotation algorithm used in `rotations_signals`:
+**`signals_engine.py`** — Pure Python signal calculation engine. Provides `_build_signals_from_df()` which runs the same 3-phase rotation algorithm used in `rotations_signals`:
 
 1. **Phase 1 — Trend & Pivots**: RV with 10-day EMA, support/resistance pivots scaled by `sqrt(252/21)`
 2. **Phase 2 — Ranges & Targets**: EMA-smoothed up/down ranges, upper/lower price targets
 3. **Phase 3 — Entry/Exit & Stats**: 6 signal types (`Up_Rot`, `Down_Rot`, `Breakout`, `Breakdown`, `BTFD`, `STFR`) with `RollingStatsAccumulator` for rolling win rate, EV, MFE/MAE
 
-Caches intraday 30m bars and signals as Parquet with universe signature validation (SHA256 of ticker list).
+Called by `main.py` to recompute signals when merging live Databento bars with historical cached data.
 
 ### Frontend (`frontend/`)
 
-**`App.tsx`** — Main orchestration component. Manages view switching (Themes/Sectors/Industries/Tickers), timeframe selection (Daily/1m/5m/30m), date range filtering, and WebSocket lifecycle. Uses `window.location.hostname` for dynamic API host detection (enables mobile-to-PC access).
+**`App.tsx`** — Main orchestration component. Manages view switching (Themes/Sectors/Industries/Tickers), date range filtering, and WebSocket lifecycle. Uses `window.location.hostname` for dynamic API host detection (enables mobile-to-PC access).
 
 **`TVChart.tsx`** — Multi-pane chart using `lightweight-charts`. Synchronized crosshairs and time scales across panes:
 - **Price pane**: Candlesticks + resistance pivots (pink) + support pivots (blue) + upper/lower targets
@@ -115,12 +114,9 @@ rotations_signals pipeline (offline)
 Databento Live API (real-time)
   → backend/main.py WebSocket proxy
     → frontend TVChart.tsx live updates
-  → backend/signals_engine.py (intraday signal calc)
-    → backend/main.py intraday endpoint
 ```
 
 ## Debug Scripts
 
 - `check_data.py` — Inspect cached data files
 - `check_pivots.py` — Validate pivot calculations
-- `debug_pickles.py` / `debug_pickles_v2.py` — Inspect pickle cache contents

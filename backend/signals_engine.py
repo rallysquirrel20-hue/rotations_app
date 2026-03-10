@@ -1,238 +1,15 @@
-import os
-import pickle
-import hashlib
-from datetime import datetime, timedelta
-from pathlib import Path
-from zoneinfo import ZoneInfo
-
-import databento as db
 import numpy as np
 import pandas as pd
-from dotenv import load_dotenv
 
 
-SIZE = int(os.getenv("UNIVERSE_SIZE", "500"))
 SIGNALS = ["Up_Rot", "Down_Rot", "Breakout", "Breakdown", "BTFD", "STFR"]
 RV_MULT = np.sqrt(252) / np.sqrt(21)
 EMA_MULT = 2.0 / 11.0
 RV_EMA_ALPHA = 2.0 / 11.0
 
-ET = ZoneInfo("America/New_York")
-BASE_OUTPUT_FOLDER = Path(os.getenv("PYTHON_OUTPUTS_DIR", Path.home() / "Documents" / "Python_Outputs")).expanduser()
-PICKLE_FOLDER = BASE_OUTPUT_FOLDER / "Data_Storage"
-PICKLE_FOLDER.mkdir(parents=True, exist_ok=True)
-
-UNIVERSE_PICKLE_PATH = Path(os.getenv("UNIVERSE_PICKLE_PATH", PICKLE_FOLDER / f"top{SIZE}stocks.pkl"))
-INTRADAY_ROOT = BASE_OUTPUT_FOLDER / "Intraday_30m"
-INTRADAY_ROOT.mkdir(parents=True, exist_ok=True)
-INTRADAY_CACHE_FILE = INTRADAY_ROOT / f"intraday_30m_cache_top_{SIZE}.pkl"
-INTRADAY_SIGNALS_CACHE_FILE = INTRADAY_ROOT / f"intraday_30m_signals_top_{SIZE}.pkl"
-SIGNAL_EXPORT_FOLDER = INTRADAY_ROOT / "Signal_Exports"
-SIGNAL_EXPORT_FOLDER.mkdir(parents=True, exist_ok=True)
-
-DATABENTO_API_KEY = os.getenv("DATABENTO_API_KEY", "")
-DATABENTO_DATASET = os.getenv("DATABENTO_DATASET", "EQUS.MINI")
-DATABENTO_STYPE_IN = os.getenv("DATABENTO_STYPE_IN", "raw_symbol")
-DATABENTO_LOOKBACK_DAYS = int(os.getenv("DATABENTO_LOOKBACK_DAYS", "90"))
-DATABENTO_SYMBOL_CHUNK = int(os.getenv("DATABENTO_SYMBOL_CHUNK", "200"))
-RTH_ONLY = os.getenv("INTRADAY_RTH_ONLY", "1").strip() not in ("0", "false", "False")
-FORCE_REBUILD_INTRADAY_CACHE = os.getenv("FORCE_REBUILD_INTRADAY_CACHE", "0").strip() in ("1", "true", "True")
-
-
-def _load_env_file():
-    try:
-        base_path = Path(__file__).resolve().parent
-    except NameError:
-        base_path = Path.cwd()
-    # Load .env: check local backend dir first, then shared ~/Documents/Repositories/.env
-    local_env = base_path / ".env"
-    shared_env = Path.home() / "Documents" / "Repositories" / ".env"
-    env_path = local_env if local_env.exists() else shared_env
-    load_dotenv(env_path, override=False)
-
-
-def _refresh_runtime_config():
-    global DATABENTO_API_KEY
-    global DATABENTO_DATASET
-    global DATABENTO_STYPE_IN
-    global DATABENTO_LOOKBACK_DAYS
-    global DATABENTO_SYMBOL_CHUNK
-    global RTH_ONLY
-    global FORCE_REBUILD_INTRADAY_CACHE
-
-    DATABENTO_API_KEY = os.getenv("DATABENTO_API_KEY", "")
-    DATABENTO_DATASET = os.getenv("DATABENTO_DATASET", "EQUS.MINI")
-    DATABENTO_STYPE_IN = os.getenv("DATABENTO_STYPE_IN", "raw_symbol")
-    DATABENTO_LOOKBACK_DAYS = int(os.getenv("DATABENTO_LOOKBACK_DAYS", "90"))
-    DATABENTO_SYMBOL_CHUNK = int(os.getenv("DATABENTO_SYMBOL_CHUNK", "200"))
-    RTH_ONLY = os.getenv("INTRADAY_RTH_ONLY", "1").strip() not in ("0", "false", "False")
-    FORCE_REBUILD_INTRADAY_CACHE = os.getenv("FORCE_REBUILD_INTRADAY_CACHE", "0").strip() in ("1", "true", "True")
-
-
-def _universe_signature(tickers):
-    h = hashlib.sha256()
-    for t in tickers:
-        h.update(t.encode("utf-8"))
-        h.update(b"|")
-    return h.hexdigest()
-
-
-def _quarter_key_for_date(dt):
-    return f"{dt.year} Q{(dt.month - 1) // 3 + 1}"
-
-
-def _latest_quarter_key(universe):
-    return max(universe.keys(), key=lambda k: (int(k.split()[0]), int(k.split()[1].replace("Q", ""))))
-
-
-def load_universe_tickers(path):
-    if not path.exists():
-        raise FileNotFoundError(f"Universe pickle not found: {path}")
-    with open(path, "rb") as f:
-        universe = pickle.load(f)
-    if not isinstance(universe, dict) or not universe:
-        raise ValueError("Universe pickle must contain a non-empty dict: quarter -> set[ticker]")
-
-    now_et = datetime.now(ET)
-    current_key = _quarter_key_for_date(now_et)
-    active_key = current_key if current_key in universe else _latest_quarter_key(universe)
-    tickers = sorted(t for t in universe.get(active_key, set()) if isinstance(t, str) and "-" not in t)
-    if not tickers:
-        raise ValueError(f"No tickers found in universe for {active_key}")
-    return active_key, tickers
-
-
-def _fetch_1m_chunk(symbols, start_ts, end_ts):
-    client = db.Historical(DATABENTO_API_KEY) if DATABENTO_API_KEY else db.Historical()
-    data = client.timeseries.get_range(
-        dataset=DATABENTO_DATASET,
-        schema="ohlcv-1m",
-        stype_in=DATABENTO_STYPE_IN,
-        symbols=symbols,
-        start=start_ts,
-        end=end_ts,
-    )
-    df = data.to_df(price_type="float")
-    if df.empty:
-        return pd.DataFrame()
-
-    if "ts_event" not in df.columns:
-        df = df.reset_index()
-    if "ts_event" not in df.columns:
-        raise ValueError("Databento response missing ts_event")
-    if "symbol" not in df.columns:
-        if isinstance(df.index, pd.MultiIndex) and "symbol" in df.index.names:
-            df = df.reset_index()
-        else:
-            raise ValueError("Databento response missing symbol")
-
-    out = df[["ts_event", "symbol", "open", "high", "low", "close", "volume"]].copy()
-    out.rename(
-        columns={
-            "ts_event": "DateTime",
-            "symbol": "Ticker",
-            "open": "Open",
-            "high": "High",
-            "low": "Low",
-            "close": "Close",
-            "volume": "Volume",
-        },
-        inplace=True,
-    )
-    out["DateTime"] = pd.to_datetime(out["DateTime"], utc=True).dt.tz_convert(ET)
-    return out
-
-
-def _resample_30m(df_1m):
-    if df_1m.empty:
-        return pd.DataFrame(columns=["Date", "Ticker", "Open", "High", "Low", "Close", "Volume"])
-
-    all_rows = []
-    for ticker, grp in df_1m.groupby("Ticker", sort=False):
-        g = grp.sort_values("DateTime").copy()
-        g = g.set_index("DateTime")
-        if RTH_ONLY:
-            g = g.between_time("09:30", "15:59")
-        if g.empty:
-            continue
-
-        r = g.resample("30min", label="left", closed="left").agg(
-            {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
-        )
-        r = r.dropna(subset=["Close"]).reset_index()
-        if r.empty:
-            continue
-        r["Ticker"] = ticker
-        r.rename(columns={"DateTime": "Date"}, inplace=True)
-        all_rows.append(r[["Date", "Ticker", "Open", "High", "Low", "Close", "Volume"]])
-
-    if not all_rows:
-        return pd.DataFrame(columns=["Date", "Ticker", "Open", "High", "Low", "Close", "Volume"])
-    out = pd.concat(all_rows, ignore_index=True).sort_values(["Ticker", "Date"]).reset_index(drop=True)
-    out["Date"] = pd.to_datetime(out["Date"]).dt.tz_convert(ET).dt.tz_localize(None)
-    return out
-
-
-def load_or_build_intraday_30m(tickers):
-    universe_sig = _universe_signature(tickers)
-    today_et = datetime.now(ET).date().isoformat()
-    if INTRADAY_CACHE_FILE.exists() and not FORCE_REBUILD_INTRADAY_CACHE:
-        try:
-            with open(INTRADAY_CACHE_FILE, "rb") as f:
-                cached = pickle.load(f)
-            meta = cached.get("meta", {})
-            data = cached.get("data")
-            if (
-                isinstance(data, pd.DataFrame)
-                and not data.empty
-                and meta.get("universe_sig") == universe_sig
-                and meta.get("dataset") == DATABENTO_DATASET
-                and meta.get("generated_date_et") == today_et
-            ):
-                print("Loaded 30m intraday cache (current ET date).")
-                return data
-        except Exception:
-            pass
-
-    end = datetime.now(ET)
-    start = end - timedelta(days=DATABENTO_LOOKBACK_DAYS)
-    start_ts = start.strftime("%Y-%m-%dT%H:%M")
-    end_ts = end.strftime("%Y-%m-%dT%H:%M")
-
-    chunks = [tickers[i:i + DATABENTO_SYMBOL_CHUNK] for i in range(0, len(tickers), DATABENTO_SYMBOL_CHUNK)]
-    all_1m = []
-    for i, chunk in enumerate(chunks, start=1):
-        print(f"Fetching Databento 1m bars: chunk {i}/{len(chunks)} ({len(chunk)} symbols)")
-        part = _fetch_1m_chunk(chunk, start_ts, end_ts)
-        if not part.empty:
-            all_1m.append(part)
-
-    if not all_1m:
-        raise ValueError("No intraday data returned from Databento.")
-
-    df_1m = pd.concat(all_1m, ignore_index=True).drop_duplicates(subset=["DateTime", "Ticker"], keep="last")
-    bars_30m = _resample_30m(df_1m)
-    if bars_30m.empty:
-        raise ValueError("Resampling produced no 30m bars.")
-
-    payload = {
-        "meta": {
-            "universe_sig": universe_sig,
-            "dataset": DATABENTO_DATASET,
-            "generated_date_et": today_et,
-            "lookback_days": DATABENTO_LOOKBACK_DAYS,
-            "rth_only": RTH_ONLY,
-        },
-        "data": bars_30m,
-    }
-    with open(INTRADAY_CACHE_FILE, "wb") as f:
-        pickle.dump(payload, f)
-    print(f"Saved 30m intraday cache: {INTRADAY_CACHE_FILE}")
-    return bars_30m
-
 
 class RollingStatsAccumulator:
-    __slots__ = ("count", "n_winners", "sum_winners", "n_losers", "sum_losers", "sum_all", "sum_sq", "sum_mfe", "sum_mae", "last_3")
+    __slots__ = ("count", "n_winners", "sum_winners", "n_losers", "sum_losers", "sum_all", "sum_sq", "sum_mfe", "sum_mae", "last_3", "sum_winner_bars", "sum_loser_bars")
 
     def __init__(self):
         self.count = 0
@@ -245,8 +22,10 @@ class RollingStatsAccumulator:
         self.sum_mfe = 0.0
         self.sum_mae = 0.0
         self.last_3 = []
+        self.sum_winner_bars = 0.0
+        self.sum_loser_bars = 0.0
 
-    def add(self, change, mfe, mae):
+    def add(self, change, mfe, mae, bars=None):
         self.count += 1
         self.sum_all += change
         self.sum_sq += change * change
@@ -256,9 +35,13 @@ class RollingStatsAccumulator:
         if change > 0:
             self.n_winners += 1
             self.sum_winners += change
+            if bars is not None:
+                self.sum_winner_bars += bars
         else:
             self.n_losers += 1
             self.sum_losers += change
+            if bars is not None:
+                self.sum_loser_bars += bars
         self.sum_mfe += mfe
         self.sum_mae += mae
 
@@ -269,6 +52,8 @@ class RollingStatsAccumulator:
         win_rate = self.n_winners / n
         avg_winner = (self.sum_winners / self.n_winners) if self.n_winners > 0 else 0.0
         avg_loser = (self.sum_losers / self.n_losers) if self.n_losers > 0 else 0.0
+        avg_winner_bars = (self.sum_winner_bars / self.n_winners) if self.n_winners > 0 else np.nan
+        avg_loser_bars = (self.sum_loser_bars / self.n_losers) if self.n_losers > 0 else np.nan
         hist_ev = (win_rate * avg_winner) + ((1 - win_rate) * avg_loser)
         ev_last_3 = float(np.mean(self.last_3)) if len(self.last_3) >= 3 else np.nan
         mean = self.sum_all / n
@@ -284,6 +69,8 @@ class RollingStatsAccumulator:
             "Win_Rate": win_rate,
             "Avg_Winner": avg_winner,
             "Avg_Loser": avg_loser,
+            "Avg_Winner_Bars": avg_winner_bars,
+            "Avg_Loser_Bars": avg_loser_bars,
             "Avg_MFE": self.sum_mfe / n,
             "Avg_MAE": self.sum_mae / n,
             "Historical_EV": hist_ev,
@@ -478,7 +265,7 @@ def _build_signals_from_df(df, ticker):
         final_change_col = np.full(n, np.nan)
         mfe_col = np.full(n, np.nan)
         mae_col = np.full(n, np.nan)
-        stats_cols = {k: np.full(n, np.nan) for k in ["Win_Rate", "Avg_Winner", "Avg_Loser", "Avg_MFE", "Avg_MAE", "Historical_EV", "Std_Dev", "Risk_Adj_EV", "EV_Last_3", "Risk_Adj_EV_Last_3", "Count"]}
+        stats_cols = {k: np.full(n, np.nan) for k in ["Win_Rate", "Avg_Winner", "Avg_Loser", "Avg_Winner_Bars", "Avg_Loser_Bars", "Avg_MFE", "Avg_MAE", "Historical_EV", "Std_Dev", "Risk_Adj_EV", "EV_Last_3", "Risk_Adj_EV_Last_3", "Count"]}
 
         open_positions = []
         accumulator = RollingStatsAccumulator()
@@ -500,7 +287,8 @@ def _build_signals_from_df(df, ticker):
                         final_change = (closes[i] - pos["entry_price"]) / pos["entry_price"]
                         mfe = (pos["max_high"] - pos["entry_price"]) / pos["entry_price"]
                         mae = (pos["min_low"] - pos["entry_price"]) / pos["entry_price"]
-                    accumulator.add(final_change, mfe, mae)
+                    bars = i - pos["entry_idx"]
+                    accumulator.add(final_change, mfe, mae, bars)
                     exit_date_col[pos["entry_idx"]] = dates[i]
                     exit_price_col[pos["entry_idx"]] = closes[i]
                     final_change_col[pos["entry_idx"]] = final_change
@@ -530,7 +318,8 @@ def _build_signals_from_df(df, ticker):
                     final_change = (exit_px - pos["entry_price"]) / pos["entry_price"]
                     mfe = (pos["max_high"] - pos["entry_price"]) / pos["entry_price"]
                     mae = (pos["min_low"] - pos["entry_price"]) / pos["entry_price"]
-                accumulator.add(final_change, mfe, mae)
+                bars = exit_idx - pos["entry_idx"]
+                accumulator.add(final_change, mfe, mae, bars)
                 exit_date_col[pos["entry_idx"]] = dates[exit_idx]
                 exit_price_col[pos["entry_idx"]] = exit_px
                 final_change_col[pos["entry_idx"]] = final_change
@@ -553,128 +342,192 @@ def _build_signals_from_df(df, ticker):
     return pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
 
 
-def build_all_signals_30m(bars_30m):
-    frames = []
-    grouped = list(bars_30m.groupby("Ticker"))
-    total = len(grouped)
-    for i, (ticker, grp) in enumerate(grouped, start=1):
-        out = _build_signals_from_df(grp.set_index("Date"), ticker)
-        if out is not None and not out.empty:
-            frames.append(out)
-        if i % 50 == 0 or i == total:
-            print(f"Signal build progress: {i}/{total}")
-    if not frames:
-        raise ValueError("No signals built for any ticker.")
-    all_signals = pd.concat(frames, ignore_index=True)
-    all_signals["Date"] = pd.to_datetime(all_signals["Date"])
-    return all_signals
+def _build_signals_next_row(prev_row, live_price, live_dt,
+                             live_high=None, live_low=None, live_open=None):
+    """Incremental one-bar update using cached last row state.
 
+    Ported from rotations_signals/rotations.py for use in the web app's
+    live-signals endpoint. For EOD updates, pass actual OHLC via
+    live_high/live_low/live_open so that BTFD (fires when low <= lower_target)
+    and STFR (fires when high >= upper_target) are detected correctly.
+    """
+    if prev_row is None or pd.isna(live_price):
+        return None
 
-def load_or_build_signals_30m(bars_30m, tickers):
-    universe_sig = _universe_signature(tickers)
-    latest_bar = pd.to_datetime(bars_30m["Date"]).max()
+    prev = prev_row.to_dict()
+    prev_date = pd.to_datetime(prev.get('Date'))
+    live_dt = pd.to_datetime(live_dt)
+    if pd.notna(prev_date) and live_dt <= prev_date:
+        live_dt = prev_date + pd.Timedelta(minutes=1)
 
-    if INTRADAY_SIGNALS_CACHE_FILE.exists() and not FORCE_REBUILD_INTRADAY_CACHE:
-        try:
-            with open(INTRADAY_SIGNALS_CACHE_FILE, "rb") as f:
-                cached = pickle.load(f)
-            meta = cached.get("meta", {})
-            data = cached.get("data")
-            if (
-                isinstance(data, pd.DataFrame)
-                and not data.empty
-                and meta.get("universe_sig") == universe_sig
-                and pd.to_datetime(meta.get("latest_bar")) == latest_bar
-            ):
-                print("Loaded 30m signals cache.")
-                return data
-        except Exception:
-            pass
+    close = float(live_price)
+    high  = float(live_high)  if live_high  is not None else close
+    low   = float(live_low)   if live_low   is not None else close
+    open_ = float(live_open)  if live_open  is not None else close
+    prev_close = prev.get('Close', np.nan)
+    if pd.isna(prev_close) or prev_close == 0:
+        return None
 
-    out = build_all_signals_30m(bars_30m)
-    payload = {"meta": {"universe_sig": universe_sig, "latest_bar": latest_bar.isoformat()}, "data": out}
-    with open(INTRADAY_SIGNALS_CACHE_FILE, "wb") as f:
-        pickle.dump(payload, f)
-    print(f"Saved 30m signals cache: {INTRADAY_SIGNALS_CACHE_FILE}")
-    return out
+    rv = abs(close - prev_close) / prev_close
+    prev_rv_ema = prev.get('RV_EMA', np.nan)
+    rv_ema = rv if pd.isna(prev_rv_ema) else (rv * RV_EMA_ALPHA + prev_rv_ema * (1 - RV_EMA_ALPHA))
 
+    prev_trend = prev.get('Trend', False)
+    prev_res = prev.get('Resistance_Pivot', np.nan)
+    prev_sup = prev.get('Support_Pivot', np.nan)
 
-def _make_signal_export(signals_df, target_date):
-    signal_flags = {
-        "Up_Rot": "Is_Up_Rotation",
-        "Down_Rot": "Is_Down_Rotation",
-        "Breakout": "Is_Breakout",
-        "Breakdown": "Is_Breakdown",
-        "BTFD": "Is_BTFD",
-        "STFR": "Is_STFR",
-    }
-    day_df = signals_df[signals_df["Date"].dt.date == target_date].copy()
-    day_df = day_df.loc[:, ~day_df.columns.duplicated(keep="last")]
-    if day_df.empty:
-        return pd.DataFrame()
+    is_up_rot = False
+    is_down_rot = False
+    rv_mult = rv_ema * RV_MULT
 
-    common_cols = ["Date", "Ticker", "Close"]
-    stat_suffixes = [
-        "Entry_Price",
-        "Win_Rate", "Avg_Winner", "Avg_Loser",
-        "Avg_MFE", "Avg_MAE", "Std_Dev",
-        "Historical_EV", "EV_Last_3",
-        "Risk_Adj_EV", "Risk_Adj_EV_Last_3", "Count",
-    ]
-
-    rows = []
-    for sig_name, flag_col in signal_flags.items():
-        sig_df = day_df[day_df[flag_col] == True].copy()
-        if sig_df.empty:
-            continue
-        prefixed = [f"{sig_name}_{s}" for s in stat_suffixes]
-        sig_df = sig_df.reindex(columns=common_cols + prefixed).copy()
-        sig_df.rename(columns={f"{sig_name}_{s}": s for s in stat_suffixes}, inplace=True)
-        sig_df.insert(3, "Signal_Type", sig_name)
-        rows.append(sig_df)
-    if not rows:
-        return pd.DataFrame()
-    return pd.concat(rows, ignore_index=True)
-
-
-def export_today_yesterday(signals_df):
-    signals_df = signals_df.copy()
-    signals_df["Date"] = pd.to_datetime(signals_df["Date"])
-    today_et = datetime.now(ET).date()
-    available_dates = sorted(signals_df["Date"].dt.date.unique())
-    yesterday_et = max([d for d in available_dates if d < today_et], default=None)
-
-    out_today = _make_signal_export(signals_df, today_et)
-    today_file = SIGNAL_EXPORT_FOLDER / f"{today_et.strftime('%Y_%m_%d')}_30m_signals_today_top_{SIZE}.csv"
-    out_today.to_csv(today_file, index=False)
-    print(f"Today signals: {len(out_today)} rows -> {today_file}")
-
-    if yesterday_et is not None:
-        out_yday = _make_signal_export(signals_df, yesterday_et)
-        yday_file = SIGNAL_EXPORT_FOLDER / f"{yesterday_et.strftime('%Y_%m_%d')}_30m_signals_yesterday_top_{SIZE}.csv"
-        out_yday.to_csv(yday_file, index=False)
-        print(f"Yesterday signals: {len(out_yday)} rows -> {yday_file}")
+    if prev_trend == False:
+        base_res = close * (1 + rv_mult)
+        resistance = base_res if pd.isna(prev_res) else min(base_res, prev_res)
+        if not pd.isna(prev_res) and close > prev_res:
+            trend = True
+            support = close * (1 - rv_mult)
+            resistance = prev_res
+            is_up_rot = True
+        else:
+            trend = False
+            support = prev_sup
     else:
-        print("No prior available trading date found for yesterday export.")
+        support = close * (1 - rv_mult) if pd.isna(prev_sup) else max(close * (1 - rv_mult), prev_sup)
+        if not pd.isna(prev_sup) and close < prev_sup:
+            trend = False
+            resistance = close * (1 + rv_mult)
+            support = prev_sup
+            is_down_rot = True
+        else:
+            trend = True
+            resistance = prev_res
 
+    rotation_change = (trend != prev_trend)
+    rotation_id = int(prev.get('Rotation_ID', 0))
+    if rotation_change:
+        rotation_id += 1
 
-def main():
-    _load_env_file()
-    _refresh_runtime_config()
-    if not DATABENTO_API_KEY:
-        raise ValueError("Missing DATABENTO_API_KEY in environment/.env")
+    prev_up_ema = prev.get('Up_Range_EMA', np.nan)
+    prev_down_ema = prev.get('Down_Range_EMA', np.nan)
+    prev_up_range = prev.get('Up_Range', np.nan)
+    prev_down_range = prev.get('Down_Range', np.nan)
 
-    active_key, tickers = load_universe_tickers(UNIVERSE_PICKLE_PATH)
-    print(f"Using universe: {active_key} ({len(tickers)} tickers)")
+    up_ema = prev_up_ema
+    down_ema = prev_down_ema
+    if rotation_change:
+        if prev_trend == True:
+            if not pd.isna(prev_up_range):
+                up_ema = prev_up_range if pd.isna(prev_up_ema) else (prev_up_range * EMA_MULT + prev_up_ema * (1 - EMA_MULT))
+        else:
+            if not pd.isna(prev_down_range):
+                down_ema = prev_down_range if pd.isna(prev_down_ema) else (prev_down_range * EMA_MULT + prev_down_ema * (1 - EMA_MULT))
 
-    bars_30m = load_or_build_intraday_30m(tickers)
-    print(f"30m bars: {len(bars_30m)} rows from {bars_30m['Date'].min()} to {bars_30m['Date'].max()}")
+    prev_rot_open = prev.get('Rotation_Open', np.nan)
+    if rotation_change:
+        rot_open = prev_close
+    else:
+        rot_open = prev_rot_open if not pd.isna(prev_rot_open) else prev_close
 
-    signals_30m = load_or_build_signals_30m(bars_30m, tickers)
-    print(f"Signals rows: {len(signals_30m)}")
+    if trend == True:
+        up_range = abs((high - rot_open) / rot_open) if rot_open else np.nan
+        down_range = np.nan
+    else:
+        down_range = abs((low - rot_open) / rot_open) if rot_open else np.nan
+        up_range = np.nan
 
-    export_today_yesterday(signals_30m)
+    prev_upper = prev.get('Upper_Target', np.nan)
+    prev_lower = prev.get('Lower_Target', np.nan)
+    upper_target = prev_upper
+    lower_target = prev_lower
 
+    if rotation_change and trend == True and not pd.isna(up_ema):
+        calculated = close * (1 + up_ema)
+        if pd.isna(prev_upper) or close > prev_upper or calculated < prev_upper:
+            upper_target = calculated
+    if rotation_change and trend == False and not pd.isna(down_ema):
+        calculated = close * (1 - down_ema)
+        if pd.isna(prev_lower) or close < prev_lower or calculated > prev_lower:
+            lower_target = calculated
 
-if __name__ == "__main__":
-    main()
+    btfd_triggered = bool(prev.get('BTFD_Triggered', False))
+    stfr_triggered = bool(prev.get('STFR_Triggered', False))
+    if rotation_change:
+        btfd_triggered = False
+        stfr_triggered = False
+
+    is_breakout = is_up_rot and not pd.isna(prev_upper) and close > prev_upper
+    is_breakdown = is_down_rot and not pd.isna(prev_lower) and close < prev_lower
+
+    is_btfd = False
+    btfd_entry = np.nan
+    if trend == False and not pd.isna(prev_lower) and low <= prev_lower and not btfd_triggered:
+        is_btfd = True
+        btfd_entry = open_ if open_ <= prev_lower else prev_lower
+        btfd_triggered = True
+
+    is_stfr = False
+    stfr_entry = np.nan
+    if trend == True and not pd.isna(prev_upper) and high >= prev_upper and not stfr_triggered:
+        is_stfr = True
+        stfr_entry = open_ if open_ >= prev_upper else prev_upper
+        stfr_triggered = True
+
+    if prev.get('Is_Breakout', False):
+        last_signal = 'breakout'
+    elif prev.get('Is_Breakdown', False):
+        last_signal = 'breakdown'
+    elif prev.get('Is_Breakout_Sequence', False):
+        last_signal = 'breakout'
+    else:
+        last_signal = 'breakdown'
+    is_breakout_seq = (last_signal == 'breakout')
+
+    new_row = prev.copy()
+    new_row.update({
+        'Date': live_dt,
+        'Open': open_,
+        'High': high,
+        'Low': low,
+        'Close': close,
+        'Volume': 0,
+        'Turnover': np.nan,
+        'RV': rv,
+        'RV_EMA': rv_ema,
+        'Trend': trend,
+        'Resistance_Pivot': resistance,
+        'Support_Pivot': support,
+        'Is_Up_Rotation': is_up_rot,
+        'Is_Down_Rotation': is_down_rot,
+        'Rotation_Open': rot_open,
+        'Up_Range': up_range,
+        'Down_Range': down_range,
+        'Up_Range_EMA': up_ema,
+        'Down_Range_EMA': down_ema,
+        'Upper_Target': upper_target,
+        'Lower_Target': lower_target,
+        'Is_Breakout': is_breakout,
+        'Is_Breakdown': is_breakdown,
+        'Is_BTFD': is_btfd,
+        'Is_STFR': is_stfr,
+        'BTFD_Target_Entry': btfd_entry,
+        'STFR_Target_Entry': stfr_entry,
+        'Is_Breakout_Sequence': is_breakout_seq,
+        'Rotation_ID': rotation_id,
+        'BTFD_Triggered': btfd_triggered,
+        'STFR_Triggered': stfr_triggered,
+    })
+
+    if is_up_rot:
+        new_row['Up_Rot_Entry_Price'] = close
+    if is_down_rot:
+        new_row['Down_Rot_Entry_Price'] = close
+    if is_breakout:
+        new_row['Breakout_Entry_Price'] = upper_target
+    if is_breakdown:
+        new_row['Breakdown_Entry_Price'] = lower_target
+    if is_btfd:
+        new_row['BTFD_Entry_Price'] = btfd_entry
+    if is_stfr:
+        new_row['STFR_Entry_Price'] = stfr_entry
+
+    return pd.Series(new_row)
