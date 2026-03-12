@@ -5,6 +5,7 @@ interface OpenSignal {
   Ticker: string
   Signal_Type: string
   Entry_Date: string | null
+  Exit_Date?: string | null
   Close: number | null
   Entry_Price: number | null
   Current_Performance: number | null
@@ -39,16 +40,18 @@ interface CumulativeReturnsData {
 interface BasketSummaryProps {
   data: {
     open_signals: OpenSignal[]
+    closed_signals?: OpenSignal[]
     correlation: CorrelationData
     cumulative_returns: CumulativeReturnsData
   } | null
   loading: boolean
   basketName: string
   apiBase: string
+  quarterDateRange?: { from: string; to: string } | null
 }
 
 type SortKey = keyof OpenSignal
-type TabType = 'breakout' | 'rotation' | 'btfd' | 'correlation' | 'returns' | 'contribution'
+type TabType = 'breakout' | 'rotation' | 'btfd' | 'breakout_closed' | 'rotation_closed' | 'btfd_closed' | 'correlation' | 'returns' | 'contribution'
 
 const SIGNAL_FILTERS: Record<'breakout' | 'rotation' | 'btfd', string[]> = {
   breakout: ['Breakout', 'Breakdown'],
@@ -57,13 +60,19 @@ const SIGNAL_FILTERS: Record<'breakout' | 'rotation' | 'btfd', string[]> = {
 }
 type CellValue = string | number | null
 
-const COLORS = [
-  '#2962ff', '#e91e63', '#00bcd4', '#ff9800', '#4caf50', '#9c27b0',
-  '#f44336', '#3f51b5', '#009688', '#ff5722', '#607d8b', '#795548',
-  '#8bc34a', '#ffc107', '#673ab7', '#03a9f4', '#cddc39', '#ff4081',
-  '#00e676', '#ea80fc', '#1de9b6', '#ff6e40', '#76ff03', '#d500f9',
-  '#64ffda', '#ffab40', '#b2ff59', '#e040fb',
-]
+// Blue (best) → Grey (mid) → Pink (worst) gradient based on rank
+function rankColor(rank: number, total: number): string {
+  if (total <= 1) return 'rgb(50, 50, 255)'
+  const t = rank / (total - 1) // 0 = best (blue), 1 = worst (pink)
+  // Blue: rgb(50, 50, 255) → Mid: rgb(152, 50, 202) → Pink: rgb(255, 50, 150)
+  if (t <= 0.5) {
+    const s = t * 2 // 0→1 within blue→mid
+    return `rgb(${Math.round(50 + 102 * s)}, 50, ${Math.round(255 - 53 * s)})`
+  } else {
+    const s = (t - 0.5) * 2 // 0→1 within mid→pink
+    return `rgb(${Math.round(152 + 103 * s)}, 50, ${Math.round(202 - 52 * s)})`
+  }
+}
 
 function pctFmt(v: number | null): string {
   if (v === null) return '--'
@@ -110,7 +119,7 @@ const LIVE_ROW_COLORS: Record<string, string> = {
   Breakout: 'rgba(50, 50, 255, 0.12)',
 }
 
-function SignalsTable({ signals }: { signals: OpenSignal[] }) {
+function SignalsTable({ signals, showExitDate }: { signals: OpenSignal[]; showExitDate?: boolean }) {
   const [sortKey, setSortKey] = useState<SortKey>('Ticker')
   const [sortAsc, setSortAsc] = useState(true)
 
@@ -119,8 +128,8 @@ function SignalsTable({ signals }: { signals: OpenSignal[] }) {
     arr.sort((a, b) => {
       const av = a[sortKey], bv = b[sortKey]
       if (typeof av === 'string' && typeof bv === 'string') return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av)
-      const an = av === null ? Number.NEGATIVE_INFINITY : Number(av)
-      const bn = bv === null ? Number.NEGATIVE_INFINITY : Number(bv)
+      const an = av === null || av === undefined ? Number.NEGATIVE_INFINITY : Number(av)
+      const bn = bv === null || bv === undefined ? Number.NEGATIVE_INFINITY : Number(bv)
       return sortAsc ? an - bn : bn - an
     })
     return arr
@@ -135,7 +144,8 @@ function SignalsTable({ signals }: { signals: OpenSignal[] }) {
     { key: 'Ticker', label: 'Ticker' },
     { key: 'Signal_Type', label: 'Signal' },
     { key: 'Entry_Date', label: 'Entry Date' },
-    { key: 'Close', label: 'Close', fmt: dollarFmtCell },
+    ...(showExitDate ? [{ key: 'Exit_Date' as SortKey, label: 'Exit Date' }] : []),
+    { key: 'Close', label: showExitDate ? 'Exit Price' : 'Close', fmt: dollarFmtCell },
     { key: 'Entry_Price', label: 'Entry', fmt: dollarFmtCell },
     { key: 'Current_Performance', label: 'Perf', fmt: pctFmtCell, color: colorForPerfCell },
     { key: 'Win_Rate', label: 'Win%', fmt: pctFmtCell },
@@ -189,7 +199,7 @@ function SignalsTable({ signals }: { signals: OpenSignal[] }) {
   )
 }
 
-function CorrelationHeatmap({ data, basketName, apiBase }: { data: CorrelationData; basketName: string; apiBase: string }) {
+function CorrelationHeatmap({ data, basketName, apiBase, quarterDateRange }: { data: CorrelationData; basketName: string; apiBase: string; quarterDateRange?: { from: string; to: string } | null }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [dims, setDims] = useState({ w: 600, h: 400 })
   const [corrDate, setCorrDate] = useState('')
@@ -208,6 +218,15 @@ function CorrelationHeatmap({ data, basketName, apiBase }: { data: CorrelationDa
       })
       .catch(() => {})
   }, [basketName, apiBase])
+
+  // Set corrDate to end of quarter range when active
+  useEffect(() => {
+    if (quarterDateRange) {
+      setCorrDate(quarterDateRange.to)
+    } else {
+      setCorrDate('')
+    }
+  }, [quarterDateRange])
 
   // Fetch correlation for selected date
   useEffect(() => {
@@ -300,14 +319,14 @@ function CorrelationHeatmap({ data, basketName, apiBase }: { data: CorrelationDa
   )
 }
 
-function ReturnsChart({ data }: { data: CumulativeReturnsData }) {
+function ReturnsChart({ data, quarterDateRange }: { data: CumulativeReturnsData; quarterDateRange?: { from: string; to: string } | null }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const [hoveredTicker, setHoveredTicker] = useState<string | null>(null)
   const [dims, setDims] = useState({ w: 800, h: 400 })
   const [presetMode, setPresetMode] = useState<'Q' | 'Y'>('Q')
 
-  // Date range state — default to 1Y lookback
+  // Date range state — default to quarter range if active, else 1Y lookback
   const allDates = data.dates
   const defaultEnd = allDates.length > 0 ? allDates[allDates.length - 1] : ''
   const defaultStart = useMemo(() => {
@@ -315,7 +334,6 @@ function ReturnsChart({ data }: { data: CumulativeReturnsData }) {
     const end = new Date(allDates[allDates.length - 1])
     end.setFullYear(end.getFullYear() - 1)
     const target = end.toISOString().slice(0, 10)
-    // Find the closest date in allDates that is >= target
     for (let i = 0; i < allDates.length; i++) {
       if (allDates[i] >= target) return allDates[i]
     }
@@ -325,11 +343,16 @@ function ReturnsChart({ data }: { data: CumulativeReturnsData }) {
   const [startDate, setStartDate] = useState('')
   const [endDate, setEndDate] = useState('')
 
-  // Initialize defaults when data loads
+  // Initialize defaults when data loads or quarter range changes
   useEffect(() => {
-    setStartDate(defaultStart)
-    setEndDate(defaultEnd)
-  }, [defaultStart, defaultEnd])
+    if (quarterDateRange) {
+      setStartDate(quarterDateRange.from)
+      setEndDate(quarterDateRange.to)
+    } else {
+      setStartDate(defaultStart)
+      setEndDate(defaultEnd)
+    }
+  }, [defaultStart, defaultEnd, quarterDateRange])
 
   const dateBoundsMin = allDates.length > 0 ? allDates[0] : ''
   const dateBoundsMax = allDates.length > 0 ? allDates[allDates.length - 1] : ''
@@ -486,11 +509,12 @@ function ReturnsChart({ data }: { data: CumulativeReturnsData }) {
       ctx.fillText(windowedData.dates[i].slice(0, 7), x, dims.h - pad.bottom + 15)
     }
 
-    // Draw lines (use origIndex for consistent color mapping)
-    sortedSeries.forEach(s => {
+    // Draw lines — blue (best) → grey → pink (worst) by rank
+    const totalSeries = sortedSeries.length
+    sortedSeries.forEach((s, rank) => {
       const isHovered = hoveredTicker === s.ticker
       const isOther = hoveredTicker !== null && !isHovered
-      ctx.strokeStyle = isOther ? '#dee2e6' : COLORS[s.origIndex % COLORS.length]
+      ctx.strokeStyle = isOther ? '#dee2e6' : rankColor(rank, totalSeries)
       ctx.lineWidth = isHovered ? 2.5 : 1.2
       ctx.globalAlpha = isOther ? 0.3 : 1
       ctx.beginPath()
@@ -539,10 +563,10 @@ function ReturnsChart({ data }: { data: CumulativeReturnsData }) {
         </div>
       </div>
       <div className="returns-legend-right">
-        {sortedSeries.map(s => (
+        {sortedSeries.map((s, rank) => (
           <div key={s.ticker}
                className={`returns-legend-item ${hoveredTicker === s.ticker ? 'highlighted' : ''}`}
-               style={{ color: COLORS[s.origIndex % COLORS.length] }}
+               style={{ color: rankColor(rank, sortedSeries.length) }}
                onMouseEnter={() => setHoveredTicker(s.ticker)}
                onMouseLeave={() => setHoveredTicker(null)}>
             {s.ticker} <span className="returns-legend-val">{(s.lastVal * 100).toFixed(1)}%</span>
@@ -567,7 +591,7 @@ interface ContributionData {
   date_range: { min: string; max: string }
 }
 
-function ContributionChart({ basketName, apiBase }: { basketName: string; apiBase: string }) {
+function ContributionChart({ basketName, apiBase, quarterDateRange }: { basketName: string; apiBase: string; quarterDateRange?: { from: string; to: string } | null }) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const [dims, setDims] = useState({ w: 800, h: 400 })
@@ -579,26 +603,39 @@ function ContributionChart({ basketName, apiBase }: { basketName: string; apiBas
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null)
   const [presetMode, setPresetMode] = useState<'Q' | 'Y'>('Q')
 
-  // Fetch date bounds on mount
+  // Fetch date bounds on mount, set initial date range
   useEffect(() => {
     if (!basketName || !apiBase) return
     axios.get(`${apiBase}/baskets/${encodeURIComponent(basketName)}/contributions`)
       .then(res => {
         if (res.data.date_range) {
           setDateBounds(res.data.date_range)
-          // Default to current quarter
-          const max = res.data.date_range.max
-          if (max) {
-            const d = new Date(max)
-            const qMonth = Math.floor(d.getMonth() / 3) * 3
-            const qStart = new Date(d.getFullYear(), qMonth, 1).toISOString().slice(0, 10)
-            setStartDate(qStart)
-            setEndDate(max)
+          if (quarterDateRange) {
+            setStartDate(quarterDateRange.from)
+            setEndDate(quarterDateRange.to)
+          } else {
+            // Default to current quarter
+            const max = res.data.date_range.max
+            if (max) {
+              const d = new Date(max)
+              const qMonth = Math.floor(d.getMonth() / 3) * 3
+              const qStart = new Date(d.getFullYear(), qMonth, 1).toISOString().slice(0, 10)
+              setStartDate(qStart)
+              setEndDate(max)
+            }
           }
         }
       })
       .catch(() => {})
   }, [basketName, apiBase])
+
+  // Update date range when quarter mode changes
+  useEffect(() => {
+    if (quarterDateRange) {
+      setStartDate(quarterDateRange.from)
+      setEndDate(quarterDateRange.to)
+    }
+  }, [quarterDateRange])
 
   // Fetch contribution data when date range changes
   useEffect(() => {
@@ -850,9 +887,10 @@ function ContributionChart({ basketName, apiBase }: { basketName: string; apiBas
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!contribData || !canvasRef.current) return
     const rect = canvasRef.current.getBoundingClientRect()
-    const mx = e.clientX - rect.left
+    const scaleX = dims.w / rect.width
+    const mx = (e.clientX - rect.left) * scaleX
     const n = contribData.tickers.length
-    const pad = { left: 60, right: 20 }
+    const pad = { left: 60, right: 50 }
     const plotW = dims.w - pad.left - pad.right
     const barW = Math.max(4, Math.min(40, (plotW / n) * 0.75))
     const gap = (plotW - barW * n) / (n + 1)
@@ -961,7 +999,7 @@ function ContributionChart({ basketName, apiBase }: { basketName: string; apiBas
   )
 }
 
-export function BasketSummary({ data, loading, basketName, apiBase }: BasketSummaryProps) {
+export function BasketSummary({ data, loading, basketName, apiBase, quarterDateRange }: BasketSummaryProps) {
   const [tab, setTab] = useState<TabType>('breakout')
 
   if (loading) return <div className="summary-panel"><div className="summary-loading">Loading basket analysis...</div></div>
@@ -969,40 +1007,68 @@ export function BasketSummary({ data, loading, basketName, apiBase }: BasketSumm
 
   const filterSignals = (key: 'breakout' | 'rotation' | 'btfd') =>
     data.open_signals.filter(s => SIGNAL_FILTERS[key].includes(s.Signal_Type))
+  const filterClosed = (key: 'breakout' | 'rotation' | 'btfd') =>
+    (data.closed_signals || []).filter(s => SIGNAL_FILTERS[key].includes(s.Signal_Type))
 
   const breakoutSignals = filterSignals('breakout')
   const rotationSignals = filterSignals('rotation')
   const btfdSignals = filterSignals('btfd')
+  const breakoutClosed = filterClosed('breakout')
+  const rotationClosed = filterClosed('rotation')
+  const btfdClosed = filterClosed('btfd')
+  const hasClosed = breakoutClosed.length > 0 || rotationClosed.length > 0 || btfdClosed.length > 0
+
+  // Reset to open tab if on a closed tab that no longer exists
+  const closedTabs: TabType[] = ['breakout_closed', 'rotation_closed', 'btfd_closed']
+  const activeTab = (!hasClosed && closedTabs.includes(tab)) ? 'breakout' : tab
 
   return (
     <div className="summary-panel">
       <div className="summary-tabs">
-        <button className={`summary-tab ${tab === 'breakout' ? 'active' : ''}`} onClick={() => setTab('breakout')}>
-          LT Trend ({breakoutSignals.length})
+        <button className={`summary-tab ${activeTab === 'breakout' ? 'active' : ''}`} onClick={() => setTab('breakout')}>
+          LT Trend{hasClosed ? ' Open' : ''} ({breakoutSignals.length})
         </button>
-        <button className={`summary-tab ${tab === 'rotation' ? 'active' : ''}`} onClick={() => setTab('rotation')}>
-          ST Trend ({rotationSignals.length})
+        {hasClosed && (
+          <button className={`summary-tab ${activeTab === 'breakout_closed' ? 'active' : ''}`} onClick={() => setTab('breakout_closed')}>
+            LT Trend Closed ({breakoutClosed.length})
+          </button>
+        )}
+        <button className={`summary-tab ${activeTab === 'rotation' ? 'active' : ''}`} onClick={() => setTab('rotation')}>
+          ST Trend{hasClosed ? ' Open' : ''} ({rotationSignals.length})
         </button>
-        <button className={`summary-tab ${tab === 'btfd' ? 'active' : ''}`} onClick={() => setTab('btfd')}>
-          BTFD/STFR ({btfdSignals.length})
+        {hasClosed && (
+          <button className={`summary-tab ${activeTab === 'rotation_closed' ? 'active' : ''}`} onClick={() => setTab('rotation_closed')}>
+            ST Trend Closed ({rotationClosed.length})
+          </button>
+        )}
+        <button className={`summary-tab ${activeTab === 'btfd' ? 'active' : ''}`} onClick={() => setTab('btfd')}>
+          BTFD/STFR{hasClosed ? ' Open' : ''} ({btfdSignals.length})
         </button>
-        <button className={`summary-tab ${tab === 'correlation' ? 'active' : ''}`} onClick={() => setTab('correlation')}>
+        {hasClosed && (
+          <button className={`summary-tab ${activeTab === 'btfd_closed' ? 'active' : ''}`} onClick={() => setTab('btfd_closed')}>
+            BTFD/STFR Closed ({btfdClosed.length})
+          </button>
+        )}
+        <button className={`summary-tab ${activeTab === 'correlation' ? 'active' : ''}`} onClick={() => setTab('correlation')}>
           Correlation
         </button>
-        <button className={`summary-tab ${tab === 'returns' ? 'active' : ''}`} onClick={() => setTab('returns')}>
+        <button className={`summary-tab ${activeTab === 'returns' ? 'active' : ''}`} onClick={() => setTab('returns')}>
           Returns
         </button>
-        <button className={`summary-tab ${tab === 'contribution' ? 'active' : ''}`} onClick={() => setTab('contribution')}>
+        <button className={`summary-tab ${activeTab === 'contribution' ? 'active' : ''}`} onClick={() => setTab('contribution')}>
           Contribution
         </button>
       </div>
       <div className="summary-content">
-        {tab === 'breakout' && <SignalsTable signals={breakoutSignals} />}
-        {tab === 'rotation' && <SignalsTable signals={rotationSignals} />}
-        {tab === 'btfd' && <SignalsTable signals={btfdSignals} />}
-        {tab === 'correlation' && <CorrelationHeatmap data={data.correlation} basketName={basketName} apiBase={apiBase} />}
-        {tab === 'returns' && <ReturnsChart data={data.cumulative_returns} />}
-        {tab === 'contribution' && <ContributionChart basketName={basketName} apiBase={apiBase} />}
+        {activeTab === 'breakout' && <SignalsTable signals={breakoutSignals} />}
+        {activeTab === 'breakout_closed' && <SignalsTable signals={breakoutClosed} showExitDate />}
+        {activeTab === 'rotation' && <SignalsTable signals={rotationSignals} />}
+        {activeTab === 'rotation_closed' && <SignalsTable signals={rotationClosed} showExitDate />}
+        {activeTab === 'btfd' && <SignalsTable signals={btfdSignals} />}
+        {activeTab === 'btfd_closed' && <SignalsTable signals={btfdClosed} showExitDate />}
+        {activeTab === 'correlation' && <CorrelationHeatmap data={data.correlation} basketName={basketName} apiBase={apiBase} quarterDateRange={quarterDateRange} />}
+        {activeTab === 'returns' && <ReturnsChart data={data.cumulative_returns} quarterDateRange={quarterDateRange} />}
+        {activeTab === 'contribution' && <ContributionChart basketName={basketName} apiBase={apiBase} quarterDateRange={quarterDateRange} />}
       </div>
     </div>
   )

@@ -28,8 +28,9 @@ interface TVChartProps {
 }
 
 const parseTime = (dateStr: string) => {
-  if (typeof dateStr === 'string' && dateStr.includes('T')) {
-    const d = new Date(dateStr.endsWith('Z') ? dateStr : dateStr + 'Z');
+  if (typeof dateStr === 'string') {
+    const s = dateStr.includes('T') ? dateStr : dateStr + 'T00:00:00';
+    const d = new Date(s.endsWith('Z') ? s : s + 'Z');
     return Math.floor(d.getTime() / 1000) as any;
   }
   return dateStr;
@@ -72,6 +73,7 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
   const seriesRefs = useRef<Record<string, ISeriesApi<any> | null>>({});
   const dataLengthRef = useRef(0);
   const timesRef = useRef<any[]>([]);
+  const savedRangeRef = useRef<{ from: number; to: number } | null>(null);
 
   const [paneHeights, setPaneHeights] = useState<Record<PaneId, number>>({
     volume:      DEFAULT_PANE_HEIGHT,
@@ -88,6 +90,15 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
   const [pinnedDetail, setPinnedDetail] = useState<CandleDetail | null>(null);
   const candleDetailCache = useRef<Map<string, CandleDetail>>(new Map());
   const lastFetchedDate = useRef<string | null>(null);
+
+  // Clear saved range when data changes (new ticker/basket) so stale bar indices aren't reused
+  const prevDataRef = useRef(data);
+  useEffect(() => {
+    if (data !== prevDataRef.current) {
+      savedRangeRef.current = null;
+      prevDataRef.current = data;
+    }
+  }, [data]);
 
   // Build a time→date string lookup from data
   const timeDateMap = useRef<Map<any, string>>(new Map());
@@ -392,10 +403,18 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
       });
     }
 
-    const initRange = { from: ohlc.length - 252, to: ohlc.length + 20 };
+    const initRange = savedRangeRef.current || { from: ohlc.length - 252, to: ohlc.length + 20 };
+    savedRangeRef.current = null;
     chartEntries.forEach(([, c]) => c.timeScale().setVisibleLogicalRange(initRange));
 
-    return () => chartEntries.forEach(([, c]) => c.remove());
+    return () => {
+      const priceChart = charts.current.price;
+      if (priceChart) {
+        const range = priceChart.timeScale().getVisibleLogicalRange();
+        if (range) savedRangeRef.current = { from: range.from, to: range.to };
+      }
+      chartEntries.forEach(([, c]) => c.remove());
+    };
   }, [data, showPivots, showTargets, props.isBasketView, props.basketName, props.apiBase, fetchCandleDetail, pinnedDetail]);
 
   // Resize charts whenever pane heights or visibility changes
@@ -445,7 +464,7 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     if (props.rangeUpdateTrigger.from || props.rangeUpdateTrigger.to) {
       const times = timesRef.current;
       const findBarIndex = (dateStr: string) => {
-        const t = parseTime(dateStr);
+        const t = parseTime(dateStr.includes('T') ? dateStr : dateStr + 'T00:00:00');
         let lo = 0, hi = times.length - 1;
         while (lo < hi) {
           const mid = Math.floor((lo + hi) / 2);

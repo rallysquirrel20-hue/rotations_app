@@ -123,22 +123,6 @@ def _find_basket_meta(slug):
             return matches[0]
     return None
 
-_DV_DATA = None
-
-def get_dv_data():
-    global _DV_DATA
-    if _DV_DATA is not None: return _DV_DATA
-    if not INDIVIDUAL_SIGNALS_FILE.exists(): return None
-    try:
-        latest_date_df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=['Date'])
-        latest_date = latest_date_df['Date'].max()
-        df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE,
-                             columns=['Ticker', 'Date', 'Close', 'Volume'],
-                             filters=[('Date', '==', latest_date)])
-        df['Dollar_Vol'] = df['Close'] * df['Volume']
-        _DV_DATA = df.set_index('Ticker')['Dollar_Vol'].to_dict()
-        return _DV_DATA
-    except: return None
 
 def clean_data_for_json(df):
     return json.loads(df.to_json(orient="records", date_format="iso"))
@@ -180,23 +164,6 @@ def get_meta_file_tickers(basket_name):
         return []
 
 
-def get_meta_file_weights(basket_name):
-    meta_file = _find_basket_meta(basket_name)
-    if not meta_file:
-        return {}
-    try:
-        with open(meta_file, 'r') as f:
-            meta = json.load(f)
-        weights = meta.get('state', {}).get('weights', {})
-        if not isinstance(weights, dict):
-            return {}
-        return {
-            str(symbol): float(weight)
-            for symbol, weight in weights.items()
-            if weight is not None
-        }
-    except Exception:
-        return {}
 
 
 def _get_universe_history(basket_name):
@@ -226,6 +193,23 @@ def _quarter_str_to_date(q_str):
     qn = int(parts[1][1])
     month = (qn - 1) * 3 + 1
     return pd.Timestamp(year=year, month=month, day=1)
+
+
+def _get_universe_tickers_for_range(basket_name, start_date, end_date):
+    """Return the union of tickers across all quarters overlapping [start_date, end_date]."""
+    history = _get_universe_history(basket_name)
+    if not history:
+        return []
+    tickers = set()
+    for q_str, q_tickers in history.items():
+        q_start = _quarter_str_to_date(q_str)
+        qn = int(q_str.split()[1][1])
+        q_end_month = qn * 3
+        q_end = pd.Timestamp(year=q_start.year, month=q_end_month, day=1) + pd.offsets.MonthEnd(0)
+        # Quarter overlaps with range if q_end >= start_date and q_start <= end_date
+        if q_end >= start_date and q_start <= end_date:
+            tickers.update(q_tickers)
+    return list(tickers)
 
 
 def _get_ticker_join_dates(basket_name, tickers):
@@ -264,68 +248,25 @@ def _get_tickers_for_date(basket_name, target_date):
     return list(quarter_data[best_q]) if best_q else []
 
 
-def _quarter_start(ts):
-    month = ((int(ts.month) - 1) // 3) * 3 + 1
-    return pd.Timestamp(year=int(ts.year), month=month, day=1)
 
-
-def compute_current_basket_weights(tickers):
-    if not tickers or not INDIVIDUAL_SIGNALS_FILE.exists():
+def get_basket_weights_from_contributions(basket_name):
+    """Read the latest Weight_BOD per ticker from the contributions parquet."""
+    contrib_file = _find_basket_contributions(basket_name)
+    if not contrib_file:
         return {}
-
-    df = pd.read_parquet(
-        INDIVIDUAL_SIGNALS_FILE,
-        columns=['Ticker', 'Date', 'Close', 'Volume'],
-        filters=[('Ticker', 'in', tickers)],
-    )
-    if df.empty:
+    try:
+        df = pd.read_parquet(contrib_file, columns=['Date', 'Ticker', 'Weight_BOD'])
+        if df.empty:
+            return {}
+        df['Date'] = pd.to_datetime(df['Date'])
+        latest = df[df['Date'] == df['Date'].max()]
+        return {
+            str(row['Ticker']): float(row['Weight_BOD'])
+            for _, row in latest.iterrows()
+            if pd.notna(row['Weight_BOD'])
+        }
+    except Exception:
         return {}
-
-    df['Date'] = pd.to_datetime(df['Date']).dt.normalize()
-    df = df.dropna(subset=['Close']).sort_values(['Ticker', 'Date'])
-    latest_date = df['Date'].max()
-    if pd.isna(latest_date):
-        return {}
-
-    quarter_start = _quarter_start(latest_date)
-
-    qtd_df = df[df['Date'] >= quarter_start].copy()
-    if qtd_df.empty:
-        return {}
-
-    qtd_df['Dollar_Vol'] = qtd_df['Close'] * qtd_df['Volume']
-    dv_means = qtd_df.groupby('Ticker')['Dollar_Vol'].mean()
-    initial = dv_means.reindex(tickers).dropna()
-    initial = initial[initial > 0]
-    if initial.empty:
-        return {}
-
-    weights = initial / initial.sum()
-
-    close_pivot = (
-        df.pivot_table(index='Date', columns='Ticker', values='Close')
-        .sort_index()
-    )
-    returns = close_pivot.pct_change()
-    quarter_returns = returns[returns.index >= quarter_start]
-
-    current_weights = weights.astype(float)
-    for _, row in quarter_returns.iterrows():
-        common = current_weights.index.intersection(row.index[row.notna()])
-        if len(common) == 0:
-            continue
-        updated = current_weights[common] * (1.0 + row[common].astype(float))
-        total = updated.sum()
-        if total > 0:
-            current_weights = updated / total
-        else:
-            current_weights = updated
-
-    return {
-        str(symbol): float(weight)
-        for symbol, weight in current_weights.items()
-        if pd.notna(weight)
-    }
 
 def _compute_live_breadth(basket_name):
     """Compute live-bar Uptrend_Pct, Breakout_Pct, Correlation_Pct from constituent ticker data."""
@@ -451,6 +392,59 @@ def list_baskets():
     for k in cats: cats[k] = sorted(set(cats[k]))
     return cats
 
+@app.get("/api/baskets/compositions")
+def get_basket_compositions():
+    """Return per-quarter ticker lists for every basket (sectors, industries, themes)."""
+    result = {}
+    # Sectors and Industries from GICS mappings
+    if GICS_MAPPINGS_FILE.exists():
+        with open(GICS_MAPPINGS_FILE, 'r') as f:
+            gics = json.load(f)
+        for group_key in ('sector_u', 'industry_u'):
+            group = gics.get(group_key, {})
+            for name, quarter_dict in group.items():
+                slug = name.replace(" ", "_")
+                result[slug] = {q: sorted(tickers) for q, tickers in quarter_dict.items()}
+    # Themes from thematic config JSON files
+    for basket_name, (fn, key) in THEMATIC_CONFIG.items():
+        p_path = THEMATIC_BASKET_CACHE / fn
+        if p_path.exists():
+            try:
+                with open(p_path, 'r') as f:
+                    data = json.load(f)
+                ud = data[key] if key is not None else data
+                result[basket_name] = {q: sorted(tickers) for q, tickers in ud.items()}
+            except Exception:
+                pass
+    return result
+
+@app.get("/api/baskets/breadth")
+def get_basket_breadth():
+    """Return latest Uptrend_Pct and Breakout_Pct for every basket."""
+    result = {}
+    for folder in BASKET_CACHE_FOLDERS:
+        if not folder.exists():
+            continue
+        for f in list(folder.glob("*_of_*_signals.parquet")) + list(folder.glob("*_of_*_basket.parquet")):
+            slug = re.sub(r'(_\d+)?_of_\d+(_signals|_basket)?$', '', f.stem)
+            if slug in result:
+                continue
+            try:
+                df = pd.read_parquet(f, columns=['Date', 'Uptrend_Pct', 'Breakout_Pct'])
+                if df.empty:
+                    continue
+                last = df.sort_values('Date').iloc[-1]
+                entry = {}
+                if pd.notna(last.get('Uptrend_Pct')):
+                    entry['uptrend_pct'] = round(float(last['Uptrend_Pct']), 1)
+                if pd.notna(last.get('Breakout_Pct')):
+                    entry['breakout_pct'] = round(float(last['Breakout_Pct']), 1)
+                if entry:
+                    result[slug] = entry
+            except Exception:
+                continue
+    return result
+
 logger.info(f"BASE_DIR: {BASE_DIR} (exists={BASE_DIR.exists()})")
 logger.info(f"DATA_STORAGE: {DATA_STORAGE} (exists={DATA_STORAGE.exists()})")
 logger.info(f"INDIVIDUAL_SIGNALS_FILE: {INDIVIDUAL_SIGNALS_FILE} (exists={INDIVIDUAL_SIGNALS_FILE.exists()})")
@@ -502,12 +496,11 @@ def get_basket_data(basket_name: str):
                     df = pd.concat([df, live_row], ignore_index=True)
                     df = df.drop_duplicates(subset=['Date'], keep='last')
 
-        latest_universe = get_latest_universe_tickers(basket_name)
-        tickers = []
-        current_weights = compute_current_basket_weights(latest_universe) if latest_universe else {}
+        current_weights = get_basket_weights_from_contributions(basket_name)
         if current_weights:
             tickers = sorted([{"symbol": s, "weight": float(w)} for s, w in current_weights.items()], key=lambda x: x['weight'], reverse=True)
-        elif latest_universe:
+        else:
+            latest_universe = get_latest_universe_tickers(basket_name)
             tickers = [{"symbol": symbol, "weight": 0.0} for symbol in latest_universe]
 
         return {"chart_data": clean_data_for_json(df), "tickers": tickers}
@@ -527,6 +520,20 @@ def list_tickers():
         df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=['Ticker'])
         return sorted(df['Ticker'].dropna().unique().tolist())
     except: raise HTTPException(status_code=500)
+
+@app.get("/api/tickers/quarters")
+def list_tickers_by_quarter():
+    """Return all quarters and their ticker universes from top500stocks.json."""
+    if not TOP_500_FILE.exists():
+        return {"quarters": [], "tickers_by_quarter": {}}
+    try:
+        with open(TOP_500_FILE, 'r') as f:
+            data = json.load(f)
+        quarters = sorted(data.keys(), reverse=True)
+        tickers_by_quarter = {q: sorted(data[q]) for q in quarters}
+        return {"quarters": quarters, "tickers_by_quarter": tickers_by_quarter}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/live-signals")
 def list_live_signal_tickers():
@@ -616,6 +623,102 @@ def list_live_signal_tickers():
         logger.exception("live-signals failed")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/ticker-signals")
+def get_ticker_signals():
+    """Return per-ticker signal summary: LT trend, ST trend, mean reversion, and daily % change."""
+    if not INDIVIDUAL_SIGNALS_FILE.exists():
+        return {}
+    try:
+        cols = ['Ticker', 'Date', 'Close', 'Volume', 'Trend', 'Is_Breakout_Sequence',
+                'Is_BTFD', 'Is_STFR', 'BTFD_Entry_Price', 'BTFD_Exit_Date',
+                'STFR_Entry_Price', 'STFR_Exit_Date']
+        cutoff = pd.Timestamp(datetime.now() - timedelta(days=14))
+        df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=cols,
+                             filters=[('Date', '>=', cutoff)])
+        df = df.sort_values(['Ticker', 'Date'])
+
+        # Track last BTFD/STFR entry dates per ticker
+        btfd_last_entry = {}
+        stfr_last_entry = {}
+        for _, r in df.iterrows():
+            t = r['Ticker']
+            if r.get('Is_BTFD', False):
+                btfd_last_entry[t] = r['Date']
+            if r.get('Is_STFR', False):
+                stfr_last_entry[t] = r['Date']
+
+        # Get last 2 rows per ticker for pct_change calculation
+        last2 = df.groupby('Ticker').tail(2)
+
+        result = {}
+        for ticker, group in last2.groupby('Ticker'):
+            rows = group.sort_values('Date')
+            final = rows.iloc[-1]
+
+            # LT Trend from Is_Breakout_Sequence
+            lt = None
+            val = final.get('Is_Breakout_Sequence')
+            if pd.notna(val):
+                lt = 'BO' if bool(val) else 'BD'
+
+            # ST Trend from Trend
+            st = None
+            trend_val = final.get('Trend')
+            if pd.notna(trend_val):
+                st = 'Up' if int(trend_val) == 1 else 'Dn'
+
+            # Mean Reversion (open trade state from Entry_Price/Exit_Date)
+            mr = None
+            btfd_open = pd.notna(final.get('BTFD_Entry_Price')) and pd.isna(final.get('BTFD_Exit_Date'))
+            stfr_open = pd.notna(final.get('STFR_Entry_Price')) and pd.isna(final.get('STFR_Exit_Date'))
+            if btfd_open and stfr_open:
+                bd = btfd_last_entry.get(ticker)
+                sd = stfr_last_entry.get(ticker)
+                mr = 'STFR' if sd and (not bd or sd > bd) else 'BTFD'
+            elif btfd_open:
+                mr = 'BTFD'
+            elif stfr_open:
+                mr = 'STFR'
+
+            # Pct change from last 2 closes
+            pct = None
+            if len(rows) >= 2:
+                prev_close = rows.iloc[-2]['Close']
+                curr_close = final['Close']
+                if pd.notna(prev_close) and pd.notna(curr_close) and prev_close != 0:
+                    pct = round((curr_close / prev_close - 1) * 100, 2)
+
+            # Dollar volume from latest row
+            dv = None
+            if pd.notna(final.get('Close')) and pd.notna(final.get('Volume')):
+                dv = round(float(final['Close']) * float(final['Volume']))
+
+            result[ticker] = {
+                'lt_trend': lt,
+                'st_trend': st,
+                'mean_rev': mr,
+                'pct_change': pct,
+                'dollar_vol': dv,
+            }
+
+        # Override pct_change with live data if available
+        live_df = _read_live_parquet(LIVE_SIGNALS_FILE)
+        if live_df is not None and not live_df.empty:
+            for _, lr in live_df.iterrows():
+                t = lr.get('Ticker')
+                if t and pd.notna(lr.get('Close')) and t in result:
+                    ticker_rows = last2[last2['Ticker'] == t].sort_values('Date')
+                    if len(ticker_rows) >= 1:
+                        prev_close = ticker_rows.iloc[-1]['Close']
+                        live_close = float(lr['Close'])
+                        if pd.notna(prev_close) and prev_close != 0:
+                            result[t]['pct_change'] = round((live_close / prev_close - 1) * 100, 2)
+
+        return result
+    except Exception as e:
+        logger.exception("ticker-signals failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/tickers/{ticker}")
 def get_ticker_data(ticker: str):
     if not INDIVIDUAL_SIGNALS_FILE.exists(): raise HTTPException(status_code=404)
@@ -673,11 +776,33 @@ def safe_int(value):
     return int(value)
 
 @app.get("/api/baskets/{basket_name}/summary")
-def get_basket_summary(basket_name: str):
+def get_basket_summary(basket_name: str, start: str = None, end: str = None):
     if not INDIVIDUAL_SIGNALS_FILE.exists():
         raise HTTPException(status_code=404, detail="Signals file not found")
     try:
-        tickers = get_latest_universe_tickers(basket_name)
+        range_start = pd.Timestamp(start) if start else None
+        range_end = pd.Timestamp(end) if end else None
+        is_range_mode = range_start is not None and range_end is not None
+
+        # Build per-quarter membership lookup for range mode
+        quarter_membership = {}  # quarter_str -> set of tickers
+        last_quarter_tickers = set()
+        if is_range_mode:
+            history = _get_universe_history(basket_name)
+            for q_str, q_tickers in history.items():
+                q_start = _quarter_str_to_date(q_str)
+                qn = int(q_str.split()[1][1])
+                q_end = pd.Timestamp(year=q_start.year, month=qn * 3, day=1) + pd.offsets.MonthEnd(0)
+                if q_end >= range_start and q_start <= range_end:
+                    quarter_membership[q_str] = set(q_tickers)
+            # Last quarter in range = the one with the latest start date
+            if quarter_membership:
+                last_q = sorted(quarter_membership.keys())[-1]
+                last_quarter_tickers = quarter_membership[last_q]
+            # Union of all tickers for data loading
+            tickers = list(set().union(*quarter_membership.values())) if quarter_membership else []
+        else:
+            tickers = get_latest_universe_tickers(basket_name)
         if not tickers:
             tickers = get_meta_file_tickers(basket_name)
         if not tickers:
@@ -704,34 +829,140 @@ def get_basket_summary(basket_name: str):
         )
         df = df.sort_values('Date')
 
+        # Filter by end date if range mode
+        if range_end is not None:
+            df = df[df['Date'] <= range_end]
+
         # For each ticker and signal pair, find which signal fired most recently
         # so we only report one open signal per pair per ticker.
+        # Also track closed trades when in range mode.
         SHORT_SIGNALS = {'Down_Rot', 'Breakdown', 'STFR'}
-        last_fired = {}  # (ticker, pair_index) -> (signal_type, entry_date)
+        last_fired = {}  # (ticker, pair_index) -> (signal_type, entry_date, entry_price)
+        closed_signals = []
+        btfd_last_entry = {}  # ticker -> (entry_date, entry_price)
+        stfr_last_entry = {}  # ticker -> (entry_date, entry_price)
+        btfd_prev_exit_date = {}  # ticker -> previous BTFD_Exit_Date
+        stfr_prev_exit_date = {}  # ticker -> previous STFR_Exit_Date
         for _, row in df.iterrows():
             ticker = row['Ticker']
             row_date = row['Date']
-            for pi, (s1, s2) in enumerate(SIGNAL_PAIRS):
+            for pi, (s1, s2) in enumerate(SIGNAL_PAIRS[:2]):
+                # Determine which signal fires on this row (s2 wins if both fire)
+                new_sig = None
                 if row.get(SIGNAL_IS_COL[s1], False):
-                    last_fired[(ticker, pi)] = (s1, row_date)
+                    new_sig = s1
                 if row.get(SIGNAL_IS_COL[s2], False):
-                    last_fired[(ticker, pi)] = (s2, row_date)
+                    new_sig = s2
+
+                if new_sig is not None:
+                    key = (ticker, pi)
+                    prev = last_fired.get(key)
+                    # If signal changed, the previous trade is closed
+                    if is_range_mode and prev is not None and prev[0] != new_sig and row_date >= range_start:
+                        prev_sig, prev_entry_date, prev_entry_price = prev
+                        exit_price = row['Close']
+                        perf = None
+                        if pd.notna(prev_entry_price) and prev_entry_price:
+                            ep = float(prev_entry_price)
+                            xp = float(exit_price)
+                            perf = (ep - xp) / ep if prev_sig in SHORT_SIGNALS else (xp - ep) / ep
+                        entry_date_str = pd.Timestamp(prev_entry_date).strftime('%Y-%m-%d') if pd.notna(prev_entry_date) else None
+                        exit_date_str = pd.Timestamp(row_date).strftime('%Y-%m-%d') if pd.notna(row_date) else None
+                        closed_signals.append({
+                            'Ticker': ticker, 'Signal_Type': prev_sig,
+                            'Entry_Date': entry_date_str, 'Exit_Date': exit_date_str,
+                            'Close': safe_float(exit_price, 2),
+                            'Entry_Price': safe_float(prev_entry_price, 2),
+                            'Current_Performance': safe_float(perf, 4),
+                            'Win_Rate': safe_float(row.get(f'{prev_sig}_Win_Rate')),
+                            'Avg_Winner': safe_float(row.get(f'{prev_sig}_Avg_Winner')),
+                            'Avg_Loser': safe_float(row.get(f'{prev_sig}_Avg_Loser')),
+                            'Avg_Winner_Bars': safe_float(row.get(f'{prev_sig}_Avg_Winner_Bars'), 1),
+                            'Avg_Loser_Bars': safe_float(row.get(f'{prev_sig}_Avg_Loser_Bars'), 1),
+                            'Avg_MFE': safe_float(row.get(f'{prev_sig}_Avg_MFE')),
+                            'Avg_MAE': safe_float(row.get(f'{prev_sig}_Avg_MAE')),
+                            'Std_Dev': safe_float(row.get(f'{prev_sig}_Std_Dev')),
+                            'Historical_EV': safe_float(row.get(f'{prev_sig}_Historical_EV')),
+                            'EV_Last_3': safe_float(row.get(f'{prev_sig}_EV_Last_3')),
+                            'Risk_Adj_EV': safe_float(row.get(f'{prev_sig}_Risk_Adj_EV')),
+                            'Risk_Adj_EV_Last_3': safe_float(row.get(f'{prev_sig}_Risk_Adj_EV_Last_3')),
+                            'Count': safe_int(row.get(f'{prev_sig}_Count')),
+                            'Is_Live': False,
+                        })
+                    # Store entry price at fire time so it's available when the trade closes
+                    new_entry_price = row.get(f'{new_sig}_Entry_Price')
+                    last_fired[key] = (new_sig, row_date, new_entry_price)
+
+            # Track BTFD/STFR independently (not paired)
+            if row.get(SIGNAL_IS_COL['BTFD'], False):
+                btfd_last_entry[ticker] = (row_date, row.get('BTFD_Entry_Price'))
+            if row.get(SIGNAL_IS_COL['STFR'], False):
+                stfr_last_entry[ticker] = (row_date, row.get('STFR_Entry_Price'))
+
+            # Detect BTFD/STFR closes via Exit_Date transition (for range mode)
+            if is_range_mode and row_date >= range_start:
+                for mr_sig, mr_entry_dict, mr_prev_exit_dict, mr_exit_col in [
+                    ('BTFD', btfd_last_entry, btfd_prev_exit_date, 'BTFD_Exit_Date'),
+                    ('STFR', stfr_last_entry, stfr_prev_exit_date, 'STFR_Exit_Date'),
+                ]:
+                    cur_exit = row.get(mr_exit_col)
+                    prev_exit = mr_prev_exit_dict.get(ticker)
+                    if pd.notna(cur_exit) and (prev_exit is None or pd.isna(prev_exit)):
+                        prev_info = mr_entry_dict.get(ticker)
+                        if prev_info is not None:
+                            prev_entry_date, prev_entry_price = prev_info
+                            exit_price = row['Close']
+                            perf = None
+                            if pd.notna(prev_entry_price) and prev_entry_price:
+                                ep = float(prev_entry_price)
+                                xp = float(exit_price)
+                                perf = (ep - xp) / ep if mr_sig in SHORT_SIGNALS else (xp - ep) / ep
+                            entry_date_str = pd.Timestamp(prev_entry_date).strftime('%Y-%m-%d') if pd.notna(prev_entry_date) else None
+                            exit_date_str = pd.Timestamp(row_date).strftime('%Y-%m-%d') if pd.notna(row_date) else None
+                            closed_signals.append({
+                                'Ticker': ticker, 'Signal_Type': mr_sig,
+                                'Entry_Date': entry_date_str, 'Exit_Date': exit_date_str,
+                                'Close': safe_float(exit_price, 2),
+                                'Entry_Price': safe_float(prev_entry_price, 2),
+                                'Current_Performance': safe_float(perf, 4),
+                                'Win_Rate': safe_float(row.get(f'{mr_sig}_Win_Rate')),
+                                'Avg_Winner': safe_float(row.get(f'{mr_sig}_Avg_Winner')),
+                                'Avg_Loser': safe_float(row.get(f'{mr_sig}_Avg_Loser')),
+                                'Avg_Winner_Bars': safe_float(row.get(f'{mr_sig}_Avg_Winner_Bars'), 1),
+                                'Avg_Loser_Bars': safe_float(row.get(f'{mr_sig}_Avg_Loser_Bars'), 1),
+                                'Avg_MFE': safe_float(row.get(f'{mr_sig}_Avg_MFE')),
+                                'Avg_MAE': safe_float(row.get(f'{mr_sig}_Avg_MAE')),
+                                'Std_Dev': safe_float(row.get(f'{mr_sig}_Std_Dev')),
+                                'Historical_EV': safe_float(row.get(f'{mr_sig}_Historical_EV')),
+                                'EV_Last_3': safe_float(row.get(f'{mr_sig}_EV_Last_3')),
+                                'Risk_Adj_EV': safe_float(row.get(f'{mr_sig}_Risk_Adj_EV')),
+                                'Risk_Adj_EV_Last_3': safe_float(row.get(f'{mr_sig}_Risk_Adj_EV_Last_3')),
+                                'Count': safe_int(row.get(f'{mr_sig}_Count')),
+                                'Is_Live': False,
+                            })
+            btfd_prev_exit_date[ticker] = row.get('BTFD_Exit_Date')
+            stfr_prev_exit_date[ticker] = row.get('STFR_Exit_Date')
 
         latest = df.groupby('Ticker').tail(1)
 
-        # Exclude delisted tickers whose data ends before the most recent date
-        max_date = latest['Date'].max()
-        latest = latest[latest['Date'] >= max_date]
+        if is_range_mode:
+            # In range mode, don't exclude delisted tickers
+            pass
+        else:
+            # Exclude delisted tickers whose data ends before the most recent date
+            max_date = latest['Date'].max()
+            latest = latest[latest['Date'] >= max_date]
 
-        # Read live closes for intraday price updates
-        live_df = _read_live_parquet(LIVE_SIGNALS_FILE)
+        # Read live closes for intraday price updates (skip in range mode)
         live_closes = {}
-        if live_df is not None:
-            for _, lr in live_df.iterrows():
-                t = lr.get('Ticker')
-                c = lr.get('Close')
-                if t and pd.notna(c):
-                    live_closes[t] = float(c)
+        if not is_range_mode:
+            live_df = _read_live_parquet(LIVE_SIGNALS_FILE)
+            if live_df is not None:
+                for _, lr in live_df.iterrows():
+                    t = lr.get('Ticker')
+                    c = lr.get('Close')
+                    if t and pd.notna(c):
+                        live_closes[t] = float(c)
 
         open_signals = []
         for _, row in latest.iterrows():
@@ -846,54 +1077,75 @@ def get_basket_summary(basket_name: str):
                 'Is_Live': st_is_live,
             })
 
-            # --- BTFD/STFR: only show open (unexited) signals ---
-            # Only flag live when live price crosses a target the historical close hadn't
+            # --- BTFD/STFR: check independently, both can be open ---
             btfd_is_live = False
+            stfr_is_live = False
             if ticker in live_closes:
                 prev_lower = row.get('Lower_Target')
                 prev_upper = row.get('Upper_Target')
                 if pd.notna(prev_lower) and close < prev_lower and hist_close >= prev_lower:
                     btfd_is_live = True
                 if pd.notna(prev_upper) and close > prev_upper and hist_close <= prev_upper:
-                    btfd_is_live = True
+                    stfr_is_live = True
 
-            pi = 2
-            s1, s2 = SIGNAL_PAIRS[pi]
-            fired = last_fired.get((ticker, pi))
-            if fired is not None:
-                active, entry_date = fired
-                entry_col = f'{active}_Entry_Price'
-                exit_col = f'{active}_Exit_Date'
+            for mr_sig, mr_entry_dict, mr_is_live in [
+                ('BTFD', btfd_last_entry, btfd_is_live),
+                ('STFR', stfr_last_entry, stfr_is_live),
+            ]:
+                entry_col = f'{mr_sig}_Entry_Price'
+                exit_col = f'{mr_sig}_Exit_Date'
                 entry_price = row.get(entry_col) if entry_col in row.index else None
-                exit_date = row.get(exit_col) if exit_col in row.index else None
-                if pd.notna(entry_price) and pd.isna(exit_date):
-                    if active in SHORT_SIGNALS:
+                exit_date_val = row.get(exit_col) if exit_col in row.index else None
+                if pd.notna(entry_price) and pd.isna(exit_date_val):
+                    entry_info = mr_entry_dict.get(ticker)
+                    entry_date = entry_info[0] if entry_info else None
+                    if mr_sig in SHORT_SIGNALS:
                         perf = (entry_price - close) / entry_price if entry_price else 0
                     else:
                         perf = (close - entry_price) / entry_price if entry_price else 0
                     entry_date_str = pd.Timestamp(entry_date).strftime('%Y-%m-%d') if pd.notna(entry_date) else None
                     open_signals.append({
-                        'Ticker': ticker, 'Signal_Type': active,
+                        'Ticker': ticker, 'Signal_Type': mr_sig,
                         'Entry_Date': entry_date_str,
                         'Close': safe_float(close, 2),
                         'Entry_Price': safe_float(entry_price, 2),
                         'Current_Performance': safe_float(perf, 4),
-                        'Win_Rate': safe_float(row.get(f'{active}_Win_Rate')),
-                        'Avg_Winner': safe_float(row.get(f'{active}_Avg_Winner')),
-                        'Avg_Loser': safe_float(row.get(f'{active}_Avg_Loser')),
-                        'Avg_Winner_Bars': safe_float(row.get(f'{active}_Avg_Winner_Bars'), 1),
-                        'Avg_Loser_Bars': safe_float(row.get(f'{active}_Avg_Loser_Bars'), 1),
-                        'Avg_MFE': safe_float(row.get(f'{active}_Avg_MFE')),
-                        'Avg_MAE': safe_float(row.get(f'{active}_Avg_MAE')),
-                        'Std_Dev': safe_float(row.get(f'{active}_Std_Dev')),
-                        'Historical_EV': safe_float(row.get(f'{active}_Historical_EV')),
-                        'EV_Last_3': safe_float(row.get(f'{active}_EV_Last_3')),
-                        'Risk_Adj_EV': safe_float(row.get(f'{active}_Risk_Adj_EV')),
-                        'Risk_Adj_EV_Last_3': safe_float(row.get(f'{active}_Risk_Adj_EV_Last_3')),
-                        'Count': safe_int(row.get(f'{active}_Count')),
-                        'Is_Live': btfd_is_live,
+                        'Win_Rate': safe_float(row.get(f'{mr_sig}_Win_Rate')),
+                        'Avg_Winner': safe_float(row.get(f'{mr_sig}_Avg_Winner')),
+                        'Avg_Loser': safe_float(row.get(f'{mr_sig}_Avg_Loser')),
+                        'Avg_Winner_Bars': safe_float(row.get(f'{mr_sig}_Avg_Winner_Bars'), 1),
+                        'Avg_Loser_Bars': safe_float(row.get(f'{mr_sig}_Avg_Loser_Bars'), 1),
+                        'Avg_MFE': safe_float(row.get(f'{mr_sig}_Avg_MFE')),
+                        'Avg_MAE': safe_float(row.get(f'{mr_sig}_Avg_MAE')),
+                        'Std_Dev': safe_float(row.get(f'{mr_sig}_Std_Dev')),
+                        'Historical_EV': safe_float(row.get(f'{mr_sig}_Historical_EV')),
+                        'EV_Last_3': safe_float(row.get(f'{mr_sig}_EV_Last_3')),
+                        'Risk_Adj_EV': safe_float(row.get(f'{mr_sig}_Risk_Adj_EV')),
+                        'Risk_Adj_EV_Last_3': safe_float(row.get(f'{mr_sig}_Risk_Adj_EV_Last_3')),
+                        'Count': safe_int(row.get(f'{mr_sig}_Count')),
+                        'Is_Live': mr_is_live,
                     })
         open_signals.sort(key=lambda x: x['Ticker'])
+        closed_signals.sort(key=lambda x: x['Ticker'])
+
+        # In range mode, filter signals by basket membership
+        if is_range_mode and quarter_membership:
+            # Open signals: only tickers in the LAST quarter of the range
+            open_signals = [s for s in open_signals if s['Ticker'] in last_quarter_tickers]
+
+            # Closed signals: only trades where ticker was in the basket at exit time
+            def _ticker_in_basket_at_date(ticker, date_str):
+                if not date_str:
+                    return False
+                dt = pd.Timestamp(date_str)
+                for q_str, q_tickers in quarter_membership.items():
+                    q_start = _quarter_str_to_date(q_str)
+                    qn = int(q_str.split()[1][1])
+                    q_end = pd.Timestamp(year=q_start.year, month=qn * 3, day=1) + pd.offsets.MonthEnd(0)
+                    if q_start <= dt <= q_end and ticker in q_tickers:
+                        return True
+                return False
+            closed_signals = [s for s in closed_signals if _ticker_in_basket_at_date(s['Ticker'], s.get('Exit_Date'))]
 
         # --- 21-Day Correlation ---
         close_df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=['Ticker', 'Date', 'Close'],
@@ -958,6 +1210,7 @@ def get_basket_summary(basket_name: str):
 
         return {
             'open_signals': open_signals,
+            'closed_signals': closed_signals,
             'correlation': {'labels': corr_labels, 'matrix': corr_values},
             'cumulative_returns': {'dates': dates, 'series': cum_series},
         }
