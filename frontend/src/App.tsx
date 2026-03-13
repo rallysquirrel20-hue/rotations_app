@@ -2,6 +2,7 @@ import { useEffect, useState, useRef, useMemo, Component, ReactNode } from 'reac
 import axios from 'axios'
 import { TVChart } from './components/TVChart'
 import { BasketSummary } from './components/BasketSummary'
+import { NewsSentiment } from './components/NewsSentiment'
 
 // DYNAMIC API BASE:
 // Automatically uses the hostname of the machine you are browsing from.
@@ -133,6 +134,7 @@ function App() {
   const [rangeUpdateTrigger, setRangeUpdateTrigger] = useState<{from?: string, to?: string, reset1Y?: boolean} | null>(null)
   const [exportTrigger, setExportTrigger] = useState<number>(0)
   const [showSummary, setShowSummary] = useState(false)
+  const [showNews, setShowNews] = useState(false)
   const [summaryData, setSummaryData] = useState<BasketSummaryData | null>(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
   const contentStackRef = useRef<HTMLDivElement>(null)
@@ -810,6 +812,14 @@ function App() {
                   Basket Analysis
                 </button>
               )}
+              {(activeTicker || isTicker) && (
+                <button
+                  className={`control-btn ${showNews ? 'primary' : ''}`}
+                  onClick={() => setShowNews(prev => !prev)}
+                >
+                  News
+                </button>
+              )}
               <button className="control-btn" onClick={() => setRangeUpdateTrigger({ reset1Y: true })}>Reset 1Y</button>
               <button className="control-btn" onClick={() => setExportTrigger(p => p + 1)}>Export Image</button>
             </div>
@@ -863,7 +873,9 @@ function App() {
             </div>
           </div>
           <div className="content-stack" ref={contentStackRef}>
-            {showSummary ? (
+            {showNews && (activeTicker || (isTicker && selectedItem)) ? (
+              <NewsSentiment ticker={activeTicker || selectedItem} apiBase={API_BASE} />
+            ) : showSummary ? (
               <BasketSummary data={summaryData} loading={summaryLoading} basketName={selectedItem} apiBase={API_BASE} quarterDateRange={isQuarterMode ? quarterToDateRange(quarterStart, quarterEnd) : null} />
             ) : (
             <div className="chart-container">

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 import asyncio
 import logging
 import signals_engine
+import news_scraper
 import re
 from zoneinfo import ZoneInfo
 
@@ -1478,6 +1479,35 @@ async def websocket_endpoint(websocket: WebSocket, ticker: str):
             await websocket.close()
         except:
             pass
+
+# ── News / Sentiment endpoints ────────────────────────────────────────────────
+
+@app.get("/api/news/{ticker}")
+async def get_ticker_news(ticker: str, limit: int = 10):
+    """Search for recent financial news about a ticker using Firecrawl."""
+    try:
+        articles = await news_scraper.scrape_news(ticker.upper(), limit=limit)
+        return {"ticker": ticker.upper(), "articles": articles}
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"News scrape failed: {e}")
+
+
+@app.post("/api/scrape")
+async def scrape_url(payload: dict):
+    """Scrape a single URL and return its content as markdown with sentiment."""
+    url = payload.get("url")
+    if not url:
+        raise HTTPException(status_code=400, detail="url is required")
+    try:
+        result = await news_scraper.scrape_url(url)
+        return result
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Scrape failed: {e}")
+
 
 if __name__ == "__main__":
     import uvicorn
