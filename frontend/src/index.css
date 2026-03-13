@@ -43,7 +43,7 @@ html, body, #root {
   background-color: var(--bg-sidebar);
   display: flex;
   flex-direction: column;
-  width: 360px;
+  width: 460px;
   border-right: 2px solid var(--border-color);
 }
 
@@ -137,9 +137,21 @@ html, body, #root {
 }
 
 .basket-name-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.col-breadth { width: 46px; text-align: center; flex-shrink: 0; font-size: 10px; font-weight: bold; }
+.basket-col-header {
+  display: flex;
+  align-items: center;
+  padding: 3px 16px 3px 42px;
+  background: var(--bg-sidebar);
+  border-bottom: 1px solid var(--border-color);
+  gap: 2px;
+  font-size: 9px;
+  font-weight: bold;
+  text-transform: uppercase;
+  color: var(--text-bold);
+}
 .accordion-basket-header.active .sig-bull,
-.accordion-basket-header.active .sig-bear { color: rgba(255, 255, 255, 0.85); }
+.accordion-basket-header.active .sig-bear,
+.accordion-basket-header.active .sig-corr { color: rgba(255, 255, 255, 0.85); }
 
 .accordion-constituents {
   background: var(--bg-main);
@@ -233,11 +245,9 @@ html, body, #root {
 }
 
 .col-ticker { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.col-wt { width: 38px; text-align: right; flex-shrink: 0; font-size: 10px; }
-.col-lt { width: 28px; text-align: center; flex-shrink: 0; font-size: 10px; font-weight: bold; }
-.col-st { width: 28px; text-align: center; flex-shrink: 0; font-size: 10px; font-weight: bold; }
-.col-mr { width: 40px; text-align: center; flex-shrink: 0; font-size: 10px; font-weight: bold; }
-.col-pct { width: 46px; text-align: right; flex-shrink: 0; font-size: 10px; font-weight: bold; }
+.col-wt, .col-lt, .col-st, .col-mr, .col-pct, .col-bkt {
+  width: 40px; text-align: center; flex-shrink: 0; font-size: 10px; font-weight: bold;
+}
 
 .col-hdr {
   cursor: pointer;
@@ -249,8 +259,17 @@ html, body, #root {
 
 .sig-bull { color: var(--color-blue); }
 .sig-bear { color: var(--color-pink); }
-.sig-live { background: rgba(50, 50, 255, 0.12); border-radius: 2px; }
-.sig-live.sig-bear { background: rgba(255, 50, 150, 0.12); }
+.sig-corr { color: #586e75; }
+
+/* Live signal cell — unselected row: solid bg + white text */
+.sig-live { background: var(--color-blue); color: #ffffff !important; border-radius: 2px; }
+.sig-live.sig-bear { background: var(--color-pink); color: #ffffff !important; }
+
+/* Live signal cell — selected (active) row: white bg + colored text */
+.accordion-item.active .sig-live { background: #ffffff; color: var(--color-blue) !important; }
+.accordion-item.active .sig-live.sig-bear { background: #ffffff; color: var(--color-pink) !important; }
+.accordion-constituent.active .sig-live { background: #ffffff; color: var(--color-blue) !important; }
+.accordion-constituent.active .sig-live.sig-bear { background: #ffffff; color: var(--color-pink) !important; }
 
 .accordion-constituent.active .sig-bull,
 .accordion-constituent.active .sig-bear,
@@ -260,8 +279,6 @@ html, body, #root {
 .accordion-item.active .col-wt {
   color: rgba(255, 255, 255, 0.85);
 }
-.accordion-item.active .sig-live,
-.accordion-constituent.active .sig-live { background: rgba(255, 255, 255, 0.15); }
 
 /* Excel-style column filter dropdown */
 .col-filter-backdrop {

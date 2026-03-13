@@ -92,15 +92,9 @@ def _find_basket_parquet(slug):
     for folder in BASKET_CACHE_FOLDERS:
         if not folder.exists():
             continue
-        # New naming: *_signals.parquet
         matches = list(folder.glob(f'{slug}_*_of_*_signals.parquet'))
         if not matches:
             matches = list(folder.glob(f'{slug}_of_*_signals.parquet'))
-        # Legacy fallback: *_basket.parquet
-        if not matches:
-            matches = list(folder.glob(f'{slug}_*_of_*_basket.parquet'))
-        if not matches:
-            matches = list(folder.glob(f'{slug}_of_*_basket.parquet'))
         if matches:
             return matches[0]
     return None
@@ -110,15 +104,9 @@ def _find_basket_meta(slug):
     for folder in BASKET_CACHE_FOLDERS:
         if not folder.exists():
             continue
-        # New naming: *_signals_meta.json
         matches = list(folder.glob(f'{slug}_*_of_*_signals_meta.json'))
         if not matches:
             matches = list(folder.glob(f'{slug}_of_*_signals_meta.json'))
-        # Legacy fallback: *_basket_meta.json
-        if not matches:
-            matches = list(folder.glob(f'{slug}_*_of_*_basket_meta.json'))
-        if not matches:
-            matches = list(folder.glob(f'{slug}_of_*_basket_meta.json'))
         if matches:
             return matches[0]
     return None
@@ -268,6 +256,54 @@ def get_basket_weights_from_contributions(basket_name):
     except Exception:
         return {}
 
+def _tally_breadth(tickers, live_close, last_hist):
+    """Count uptrend and breakout tickers given live prices and last historical signals."""
+    uptrend = bo_seq = total = 0
+    for t in tickers:
+        if t not in live_close or t not in last_hist.index:
+            continue
+        total += 1
+        lc = live_close[t]
+        r = last_hist.loc[t]
+
+        prev_res = r['Resistance_Pivot']
+        prev_sup = r['Support_Pivot']
+        prev_trend = r['Trend']
+        prev_upper = r['Upper_Target']
+        prev_lower = r['Lower_Target']
+        prev_bo = r['Is_Breakout_Sequence']
+
+        is_up_rot = pd.notna(prev_res) and lc > prev_res
+        is_down_rot = pd.notna(prev_sup) and lc < prev_sup
+
+        if is_up_rot:
+            trend = True
+        elif is_down_rot:
+            trend = False
+        else:
+            trend = bool(prev_trend) if pd.notna(prev_trend) else False
+
+        if trend:
+            uptrend += 1
+
+        is_bo = is_up_rot and pd.notna(prev_upper) and lc > prev_upper
+        is_bd = is_down_rot and pd.notna(prev_lower) and lc < prev_lower
+
+        if is_bo:
+            live_bo = True
+        elif is_bd:
+            live_bo = False
+        else:
+            live_bo = bool(prev_bo) if pd.notna(prev_bo) else False
+
+        if live_bo:
+            bo_seq += 1
+
+    if total == 0:
+        return None
+    return {'Uptrend_Pct': round(uptrend / total * 100, 1), 'Breakout_Pct': round(bo_seq / total * 100, 1)}
+
+
 def _compute_live_breadth(basket_name):
     """Compute live-bar Uptrend_Pct, Breakout_Pct, Correlation_Pct from constituent ticker data."""
     tickers = get_latest_universe_tickers(basket_name)
@@ -283,65 +319,16 @@ def _compute_live_breadth(basket_name):
         return {}
     live_close = live_prices['Close'].to_dict()
 
-    # Read last historical row per constituent
     needed_cols = ['Ticker', 'Date', 'Close', 'Trend', 'Resistance_Pivot', 'Support_Pivot',
                    'Upper_Target', 'Lower_Target', 'Is_Breakout_Sequence']
     hist = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=needed_cols, filters=[('Ticker', 'in', tickers)])
     last = hist.sort_values('Date').groupby('Ticker').tail(1).set_index('Ticker')
 
-    uptrend = 0
-    bo_seq = 0
-    total = 0
-
-    for t in tickers:
-        if t not in live_close or t not in last.index:
-            continue
-        total += 1
-        lc = live_close[t]
-        r = last.loc[t]
-
-        prev_res = r['Resistance_Pivot']
-        prev_sup = r['Support_Pivot']
-        prev_trend = r['Trend']
-        prev_upper = r['Upper_Target']
-        prev_lower = r['Lower_Target']
-        prev_bo = r['Is_Breakout_Sequence']
-
-        # Incremental trend from pivots
-        is_up_rot = pd.notna(prev_res) and lc > prev_res
-        is_down_rot = pd.notna(prev_sup) and lc < prev_sup
-
-        if is_up_rot:
-            trend = True
-        elif is_down_rot:
-            trend = False
-        else:
-            trend = bool(prev_trend) if pd.notna(prev_trend) else False
-
-        if trend:
-            uptrend += 1
-
-        # Incremental breakout sequence from pivots + targets
-        is_bo = is_up_rot and pd.notna(prev_upper) and lc > prev_upper
-        is_bd = is_down_rot and pd.notna(prev_lower) and lc < prev_lower
-
-        if is_bo:
-            live_bo = True
-        elif is_bd:
-            live_bo = False
-        else:
-            live_bo = bool(prev_bo) if pd.notna(prev_bo) else False
-
-        if live_bo:
-            bo_seq += 1
-
-    if total == 0:
+    breadth = _tally_breadth(tickers, live_close, last)
+    if breadth is None:
         return {}
 
-    result = {
-        'Uptrend_Pct': round(uptrend / total * 100, 1),
-        'Breakout_Pct': round(bo_seq / total * 100, 1),
-    }
+    result = dict(breadth)
 
     # Correlation_Pct: avg pairwise correlation of last 21 days of returns including live
     try:
@@ -382,9 +369,8 @@ def list_baskets():
     for folder in BASKET_CACHE_FOLDERS:
         if not folder.exists():
             continue
-        for f in list(folder.glob("*_of_*_signals.parquet")) + list(folder.glob("*_of_*_basket.parquet")):
-            name = f.stem
-            name = name.rsplit("_signals", 1)[0].rsplit("_basket", 1)[0]
+        for f in folder.glob("*_of_*_signals.parquet"):
+            name = f.stem.rsplit("_signals", 1)[0]
             slug = re.sub(r'(_\d+)?_of_\d+$', '', name)
             if slug in t_names: cats["Themes"].append(slug)
             elif slug in s_names: cats["Sectors"].append(slug)
@@ -425,24 +411,127 @@ def get_basket_breadth():
     for folder in BASKET_CACHE_FOLDERS:
         if not folder.exists():
             continue
-        for f in list(folder.glob("*_of_*_signals.parquet")) + list(folder.glob("*_of_*_basket.parquet")):
-            slug = re.sub(r'(_\d+)?_of_\d+(_signals|_basket)?$', '', f.stem)
+        for f in folder.glob("*_of_*_signals.parquet"):
+            slug = re.sub(r'(_\d+)?_of_\d+_signals$', '', f.stem)
             if slug in result:
                 continue
             try:
-                df = pd.read_parquet(f, columns=['Date', 'Uptrend_Pct', 'Breakout_Pct'])
+                sig_cols = ['Date', 'Close', 'Uptrend_Pct', 'Breakout_Pct', 'Correlation_Pct',
+                            'Trend', 'Is_Breakout_Sequence',
+                            'Resistance_Pivot', 'Support_Pivot', 'Upper_Target', 'Lower_Target',
+                            'BTFD_Entry_Price', 'BTFD_Exit_Date', 'STFR_Entry_Price', 'STFR_Exit_Date']
+                df = pd.read_parquet(f, columns=sig_cols)
                 if df.empty:
                     continue
-                last = df.sort_values('Date').iloc[-1]
+                df = df.sort_values('Date')
+                last = df.iloc[-1]
                 entry = {}
                 if pd.notna(last.get('Uptrend_Pct')):
                     entry['uptrend_pct'] = round(float(last['Uptrend_Pct']), 1)
                 if pd.notna(last.get('Breakout_Pct')):
                     entry['breakout_pct'] = round(float(last['Breakout_Pct']), 1)
-                if entry:
-                    result[slug] = entry
+                if pd.notna(last.get('Correlation_Pct')):
+                    entry['corr_pct'] = round(float(last['Correlation_Pct']), 1)
+                entry['st_trend'] = 'UP' if last.get('Trend') else 'DN'
+                entry['lt_trend'] = 'BO' if last.get('Is_Breakout_Sequence') else 'BD'
+                # Mean reversion
+                btfd_open = pd.notna(last.get('BTFD_Entry_Price')) and pd.isna(last.get('BTFD_Exit_Date'))
+                stfr_open = pd.notna(last.get('STFR_Entry_Price')) and pd.isna(last.get('STFR_Exit_Date'))
+                if btfd_open and stfr_open:
+                    entry['mean_rev'] = 'BTFD'  # prefer BTFD for baskets
+                elif btfd_open:
+                    entry['mean_rev'] = 'BTFD'
+                elif stfr_open:
+                    entry['mean_rev'] = 'STFR'
+                # Pct change from last 2 closes
+                if len(df) >= 2:
+                    prev_close = df.iloc[-2]['Close']
+                    curr_close = last['Close']
+                    if pd.notna(prev_close) and pd.notna(curr_close) and prev_close != 0:
+                        entry['pct_change'] = round(float(curr_close / prev_close - 1) * 100, 2)
+                # Stash pivots and prev close for live overlay
+                entry['_pivots'] = {
+                    'Trend': last.get('Trend'),
+                    'Is_Breakout_Sequence': last.get('Is_Breakout_Sequence'),
+                    'Resistance_Pivot': last.get('Resistance_Pivot'),
+                    'Support_Pivot': last.get('Support_Pivot'),
+                    'Upper_Target': last.get('Upper_Target'),
+                    'Lower_Target': last.get('Lower_Target'),
+                }
+                entry['_prev_close'] = float(last['Close']) if pd.notna(last.get('Close')) else None
+                result[slug] = entry
             except Exception:
                 continue
+
+    # Overlay live breadth values (single batch read of signals parquet)
+    try:
+        live_df = _read_live_parquet(LIVE_SIGNALS_FILE)
+        if live_df is not None:
+            live_close = live_df.set_index('Ticker')['Close'].to_dict()
+            needed_cols = ['Ticker', 'Date', 'Trend', 'Resistance_Pivot', 'Support_Pivot',
+                           'Upper_Target', 'Lower_Target', 'Is_Breakout_Sequence']
+            hist = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, columns=needed_cols,
+                                   filters=[('Ticker', 'in', list(live_close.keys()))])
+            last_hist = hist.sort_values('Date').groupby('Ticker').tail(1).set_index('Ticker')
+
+            for slug in list(result.keys()):
+                tickers = get_latest_universe_tickers(slug)
+                if not tickers:
+                    continue
+                breadth = _tally_breadth(tickers, live_close, last_hist)
+                if breadth:
+                    result[slug]['uptrend_pct'] = breadth['Uptrend_Pct']
+                    result[slug]['breakout_pct'] = breadth['Breakout_Pct']
+    except Exception:
+        pass
+
+    # Overlay live basket equity curve signals using live basket OHLC + cached pivots
+    try:
+        live_basket_df = _read_live_parquet(LIVE_BASKET_SIGNALS_FILE)
+        if live_basket_df is not None:
+            name_col = 'BasketName' if 'BasketName' in live_basket_df.columns else 'Basket'
+            for slug, entry in result.items():
+                pivots = entry.get('_pivots')
+                if not pivots:
+                    continue
+                basket_name_spaced = slug.replace('_', ' ')
+                live_row = live_basket_df[live_basket_df[name_col].str.endswith(basket_name_spaced)]
+                if live_row.empty:
+                    continue
+                lc = float(live_row.iloc[0]['Close'])
+
+                prev_res = pivots['Resistance_Pivot']
+                prev_sup = pivots['Support_Pivot']
+                is_up = pd.notna(prev_res) and lc > prev_res
+                is_dn = pd.notna(prev_sup) and lc < prev_sup
+
+                if is_up:
+                    entry['st_trend'] = 'UP'
+                elif is_dn:
+                    entry['st_trend'] = 'DN'
+
+                prev_upper = pivots['Upper_Target']
+                prev_lower = pivots['Lower_Target']
+                is_bo = is_up and pd.notna(prev_upper) and lc > prev_upper
+                is_bd = is_dn and pd.notna(prev_lower) and lc < prev_lower
+
+                if is_bo:
+                    entry['lt_trend'] = 'BO'
+                elif is_bd:
+                    entry['lt_trend'] = 'BD'
+
+                # Live pct_change from cached prev close
+                prev_close = entry.get('_prev_close')
+                if prev_close and prev_close != 0:
+                    entry['pct_change'] = round(float(lc / prev_close - 1) * 100, 2)
+    except Exception:
+        pass
+
+    # Strip internal fields before returning
+    for entry in result.values():
+        entry.pop('_pivots', None)
+        entry.pop('_prev_close', None)
+
     return result
 
 logger.info(f"BASE_DIR: {BASE_DIR} (exists={BASE_DIR.exists()})")
@@ -686,7 +775,7 @@ def get_ticker_signals():
                 prev_close = rows.iloc[-2]['Close']
                 curr_close = final['Close']
                 if pd.notna(prev_close) and pd.notna(curr_close) and prev_close != 0:
-                    pct = round((curr_close / prev_close - 1) * 100, 2)
+                    pct = round(float(curr_close / prev_close - 1) * 100, 2)
 
             # Dollar volume from latest row
             dv = None
@@ -697,8 +786,8 @@ def get_ticker_signals():
                 'lt_trend': lt,
                 'st_trend': st,
                 'mean_rev': mr,
-                'pct_change': pct,
-                'dollar_vol': dv,
+                'pct_change': float(pct) if pct is not None else None,
+                'dollar_vol': int(dv) if dv is not None else None,
             }
 
         # Override pct_change with live data if available
@@ -712,7 +801,7 @@ def get_ticker_signals():
                         prev_close = ticker_rows.iloc[-1]['Close']
                         live_close = float(lr['Close'])
                         if pd.notna(prev_close) and prev_close != 0:
-                            result[t]['pct_change'] = round((live_close / prev_close - 1) * 100, 2)
+                            result[t]['pct_change'] = round(float(live_close / prev_close - 1) * 100, 2)
 
         return result
     except Exception as e:
@@ -726,28 +815,36 @@ def get_ticker_data(ticker: str):
         df = pd.read_parquet(INDIVIDUAL_SIGNALS_FILE, filters=[('Ticker', '==', ticker)])
         df['Date'] = pd.to_datetime(df['Date'])
 
-        # Merge live data and recompute signals for today's candle
+        # Merge live bar using incremental signal computation (matches live-signals endpoint)
         live_df = _read_live_parquet(LIVE_SIGNALS_FILE)
         if live_df is not None:
             live_row = live_df[live_df['Ticker'] == ticker]
             if not live_row.empty:
-                live_row = live_row.copy()
-                live_row['Date'] = pd.to_datetime(live_row['Date'])
+                lr = live_row.iloc[0]
+                live_date = pd.to_datetime(lr['Date'])
 
-                # Build combined OHLC and recompute all signals including live bar
-                ohlc_cols = ['Date', 'Open', 'High', 'Low', 'Close']
-                if 'Volume' in df.columns:
-                    ohlc_cols.append('Volume')
-                live_ohlc = live_row[[c for c in ohlc_cols if c in live_row.columns]].copy()
-                if 'Volume' not in live_ohlc.columns:
-                    live_ohlc['Volume'] = 0
-                combined = pd.concat([df[ohlc_cols], live_ohlc], ignore_index=True)
-                combined = combined.drop_duplicates(subset=['Date'], keep='last').sort_values('Date')
+                # Drop any existing row for today (in case cached parquet already has it)
+                df = df[df['Date'] < live_date]
 
-                result = signals_engine._build_signals_from_df(combined.set_index('Date'), ticker)
-                if result is not None:
-                    result['Date'] = pd.to_datetime(result['Date']).dt.strftime('%Y-%m-%d')
-                    return {"chart_data": clean_data_for_json(result.sort_values('Date')), "tickers": []}
+                # Use last cached row + _build_signals_next_row (same path as /api/live-signals)
+                prev = df.sort_values('Date').iloc[-1]
+                ohlc = {
+                    'Close': float(lr['Close']) if pd.notna(lr.get('Close')) else None,
+                    'Open':  float(lr['Open'])  if pd.notna(lr.get('Open'))  else None,
+                    'High':  float(lr['High'])  if pd.notna(lr.get('High'))  else None,
+                    'Low':   float(lr['Low'])   if pd.notna(lr.get('Low'))   else None,
+                }
+                if ohlc['Close'] is not None:
+                    new_row = signals_engine._build_signals_next_row(
+                        prev, ohlc['Close'], live_date,
+                        live_high=ohlc.get('High'),
+                        live_low=ohlc.get('Low'),
+                        live_open=ohlc.get('Open'),
+                    )
+                    if new_row is not None:
+                        live_bar = pd.DataFrame([new_row])
+                        live_bar['Source'] = 'live'
+                        df = pd.concat([df, live_bar], ignore_index=True)
 
         df['Date'] = df['Date'].dt.strftime('%Y-%m-%d')
         return {"chart_data": clean_data_for_json(df.sort_values('Date')), "tickers": []}
@@ -817,7 +914,8 @@ def get_basket_summary(basket_name: str, start: str = None, end: str = None):
             'Risk_Adj_EV', 'Risk_Adj_EV_Last_3', 'Count',
         ]
         cols_needed = ['Ticker', 'Date', 'Close', 'Trend', 'Is_Breakout_Sequence',
-                       'Resistance_Pivot', 'Support_Pivot', 'Upper_Target', 'Lower_Target']
+                       'Resistance_Pivot', 'Support_Pivot', 'Upper_Target', 'Lower_Target',
+                       'BTFD_Triggered', 'STFR_Triggered']
         for st in SIGNAL_TYPES:
             cols_needed.append(SIGNAL_IS_COL[st])
             for suf in STAT_SUFFIXES:
@@ -1083,9 +1181,17 @@ def get_basket_summary(basket_name: str, start: str = None, end: str = None):
             if ticker in live_closes:
                 prev_lower = row.get('Lower_Target')
                 prev_upper = row.get('Upper_Target')
-                if pd.notna(prev_lower) and close < prev_lower and hist_close >= prev_lower:
+                hist_btfd_triggered = bool(row.get('BTFD_Triggered', False))
+                hist_stfr_triggered = bool(row.get('STFR_Triggered', False))
+                # BTFD: prev candle was downtrend, still in downtrend, close <= lower target, not triggered
+                if (pd.notna(prev_lower) and close <= prev_lower
+                        and hist_trend == 0.0 and live_trend == 0.0
+                        and not hist_btfd_triggered):
                     btfd_is_live = True
-                if pd.notna(prev_upper) and close > prev_upper and hist_close <= prev_upper:
+                # STFR: prev candle was uptrend, still in uptrend, close >= upper target, not triggered
+                if (pd.notna(prev_upper) and close >= prev_upper
+                        and hist_trend == 1.0 and live_trend == 1.0
+                        and not hist_stfr_triggered):
                     stfr_is_live = True
 
             for mr_sig, mr_entry_dict, mr_is_live in [

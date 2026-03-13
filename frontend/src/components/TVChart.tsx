@@ -268,6 +268,26 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
       ss.setData(sp); ss.setMarkers(sm);
     }
 
+    // BTFD / STFR entry arrows (always-on debug overlay)
+    {
+      const btfdSeries = pc.addLineSeries({ color: 'transparent', priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: false });
+      const stfrSeries = pc.addLineSeries({ color: 'transparent', priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: false });
+      const btfdData: any[] = [], btfdMarkers: any[] = [];
+      const stfrData: any[] = [], stfrMarkers: any[] = [];
+      sortedData.forEach((d, i) => {
+        if (d.Is_BTFD === true) {
+          btfdData.push({ time: times[i], value: Number(d.Low) });
+          btfdMarkers.push({ time: times[i], position: 'belowBar', color: 'rgb(0, 180, 0)', shape: 'arrowUp', size: 1.5, text: 'BTFD' });
+        }
+        if (d.Is_STFR === true) {
+          stfrData.push({ time: times[i], value: Number(d.High) });
+          stfrMarkers.push({ time: times[i], position: 'aboveBar', color: COLOR_PINK, shape: 'arrowDown', size: 1.5, text: 'STFR' });
+        }
+      });
+      if (btfdData.length) { btfdSeries.setData(btfdData); btfdSeries.setMarkers(btfdMarkers); }
+      if (stfrData.length) { stfrSeries.setData(stfrData); stfrSeries.setMarkers(stfrMarkers); }
+    }
+
     if (showTargets) {
       const uT = sortedData.filter(d => d.Upper_Target != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Upper_Target) }));
       const lT = sortedData.filter(d => d.Lower_Target != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Lower_Target) }));

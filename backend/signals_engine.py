@@ -91,6 +91,7 @@ def _build_signals_from_df(df, ticker):
     closes = df["Close"].values
     highs = df["High"].values
     lows = df["Low"].values
+    opens = df["Open"].values
     df["RV"] = abs(df["Close"] - df["Close"].shift(1)) / df["Close"].shift(1)
     df["RV_EMA"] = df["RV"].ewm(span=10, adjust=False).mean()
     rv_emas = df["RV_EMA"].values
@@ -196,15 +197,15 @@ def _build_signals_from_df(df, ticker):
             is_breakout[i] = True
         if is_down_rot[i] and not np.isnan(lower_target[i - 1]) and closes[i] < lower_target[i - 1]:
             is_breakdown[i] = True
-        if trends[i] is False and not np.isnan(lower_target[i]) and lows[i] <= lower_target[i]:
+        if trends[i] is False and not np.isnan(lower_target[i - 1]) and lows[i] <= lower_target[i - 1]:
             if rotation_id not in btfd_rotations:
                 is_btfd[i] = True
-                btfd_entry_price[i] = lower_target[i]
+                btfd_entry_price[i] = opens[i] if opens[i] <= lower_target[i - 1] else lower_target[i - 1]
                 btfd_rotations.add(rotation_id)
-        if trends[i] is True and not np.isnan(upper_target[i]) and highs[i] >= upper_target[i]:
+        if trends[i] is True and not np.isnan(upper_target[i - 1]) and highs[i] >= upper_target[i - 1]:
             if rotation_id not in stfr_rotations:
                 is_stfr[i] = True
-                stfr_entry_price[i] = upper_target[i]
+                stfr_entry_price[i] = opens[i] if opens[i] >= upper_target[i - 1] else upper_target[i - 1]
                 stfr_rotations.add(rotation_id)
         btfd_triggered_state[i] = rotation_id in btfd_rotations
         stfr_triggered_state[i] = rotation_id in stfr_rotations
@@ -460,14 +461,14 @@ def _build_signals_next_row(prev_row, live_price, live_dt,
 
     is_btfd = False
     btfd_entry = np.nan
-    if trend == False and not pd.isna(prev_lower) and low <= prev_lower and not btfd_triggered:
+    if trend == False and prev_trend == False and not pd.isna(prev_lower) and low <= prev_lower and not btfd_triggered:
         is_btfd = True
         btfd_entry = open_ if open_ <= prev_lower else prev_lower
         btfd_triggered = True
 
     is_stfr = False
     stfr_entry = np.nan
-    if trend == True and not pd.isna(prev_upper) and high >= prev_upper and not stfr_triggered:
+    if trend == True and prev_trend == True and not pd.isna(prev_upper) and high >= prev_upper and not stfr_triggered:
         is_stfr = True
         stfr_entry = open_ if open_ >= prev_upper else prev_upper
         stfr_triggered = True

@@ -76,6 +76,7 @@ type SearchCategory = 'all' | 'Themes' | 'Sectors' | 'Industries' | 'Tickers';
 interface SearchResult { name: string; category: ViewType; displayName: string; }
 interface TickerSignalSummary { lt_trend: string | null; st_trend: string | null; mean_rev: string | null; pct_change: number | null; dollar_vol: number | null; }
 type SignalSortCol = 'ticker' | 'wt' | 'lt' | 'st' | 'mr' | 'pct'
+type BasketSortCol = 'name' | 'bo' | 'br' | 'cor' | 'lt' | 'st' | 'mr' | 'chg'
 
 function getSigSortVal(ticker: string, col: SignalSortCol, sigs: Record<string, TickerSignalSummary>): string | number {
   if (col === 'ticker') return ticker
@@ -110,7 +111,7 @@ function App() {
   const [baskets, setBaskets] = useState<BasketsData>({ Themes: [], Sectors: [], Industries: [] })
   const [tickers, setTickers] = useState<string[]>([])
   const [liveSignalTickers, setLiveSignalTickers] = useState<LiveSignalTicker[]>([])
-  const [basketBreadth, setBasketBreadth] = useState<Record<string, { uptrend_pct?: number; breakout_pct?: number }>>({})
+  const [basketBreadth, setBasketBreadth] = useState<Record<string, { uptrend_pct?: number; breakout_pct?: number; corr_pct?: number; lt_trend?: string; st_trend?: string; mean_rev?: string; pct_change?: number }>>({})
   const [viewType, setViewType] = useState<ViewType>('LiveSignals')
   const [expandedViews, setExpandedViews] = useState<Set<ViewType>>(new Set(['LiveSignals']))
   const [expandedBasket, setExpandedBasket] = useState<string | null>(null)
@@ -160,6 +161,14 @@ function App() {
   const [tFilterOpen, setTFilterOpen] = useState<SignalSortCol | null>(null)
   const [cFilterOpen, setCFilterOpen] = useState<SignalSortCol | null>(null)
   const [lsFilterOpen, setLsFilterOpen] = useState<SignalSortCol | null>(null)
+
+  // Basket sort/filter state
+  const [bSortCol, setBSortCol] = useState<BasketSortCol>('name')
+  const [bSortDir, setBSortDir] = useState<1 | -1>(1)
+  const [bFilterLT, setBFilterLT] = useState<string | null>(null)
+  const [bFilterST, setBFilterST] = useState<string | null>(null)
+  const [bFilterMR, setBFilterMR] = useState<string | null>(null)
+  const [bFilterOpen, setBFilterOpen] = useState<BasketSortCol | null>(null)
 
   // Quarter universe state
   const [quarterData, setQuarterData] = useState<Record<string, string[]>>({})
@@ -231,6 +240,10 @@ function App() {
       if (!existing) continue
       const copy = { ...existing }
       const cols = new Set<string>()
+      const sigs = new Set(lst.signals)
+      // Live Breakdown closes open BTFD; live Breakout closes open STFR
+      if (sigs.has('Breakdown') && copy.mean_rev === 'BTFD') { copy.mean_rev = null; cols.add('mr') }
+      if (sigs.has('Breakout') && copy.mean_rev === 'STFR') { copy.mean_rev = null; cols.add('mr') }
       for (const sig of lst.signals) {
         if (sig === 'Up_Rot') { copy.st_trend = 'Up'; cols.add('st') }
         if (sig === 'Down_Rot') { copy.st_trend = 'Dn'; cols.add('st') }
@@ -566,6 +579,122 @@ function App() {
     )
   }
 
+  // Basket sorting
+  const getBasketSortVal = (slug: string, col: BasketSortCol): string | number => {
+    if (col === 'name') return slug
+    const b = basketBreadth[slug]
+    if (!b) return col === 'chg' || col === 'bo' || col === 'br' || col === 'cor' ? -Infinity : ''
+    switch (col) {
+      case 'bo': return b.breakout_pct ?? -Infinity
+      case 'br': return b.uptrend_pct ?? -Infinity
+      case 'cor': return b.corr_pct ?? -Infinity
+      case 'lt': return b.lt_trend || ''
+      case 'st': return b.st_trend || ''
+      case 'mr': return b.mean_rev || ''
+      case 'chg': return b.pct_change ?? -Infinity
+      default: return ''
+    }
+  }
+
+  const sortBaskets = (items: string[]): string[] => {
+    let list = items
+    if (bFilterLT) list = list.filter(s => basketBreadth[s]?.lt_trend === bFilterLT)
+    if (bFilterST) list = list.filter(s => basketBreadth[s]?.st_trend === bFilterST)
+    if (bFilterMR) list = list.filter(s => basketBreadth[s]?.mean_rev === bFilterMR)
+    return [...list].sort((a, b) => {
+      const va = getBasketSortVal(a, bSortCol)
+      const vb = getBasketSortVal(b, bSortCol)
+      if (typeof va === 'number' && typeof vb === 'number') return (va - vb) * bSortDir
+      return String(va).localeCompare(String(vb)) * bSortDir
+    })
+  }
+
+  const renderBasketColHeader = () => {
+    const arrow = (col: BasketSortCol) => bSortCol === col ? (bSortDir === 1 ? ' \u25B2' : ' \u25BC') : ''
+    const hasFilter = !!(bFilterLT || bFilterST || bFilterMR)
+
+    const handleClick = (col: BasketSortCol) => {
+      if (col === 'name' || col === 'bo' || col === 'br' || col === 'cor' || col === 'chg') {
+        if (bSortCol === col) setBSortDir(bSortDir === 1 ? -1 : 1)
+        else { setBSortCol(col); setBSortDir(col === 'name' ? 1 : -1) }
+        setBFilterOpen(null)
+      } else {
+        setBFilterOpen(bFilterOpen === col ? null : col)
+      }
+    }
+
+    const filterCfg: Record<string, {vals: [string,string], cur: string|null, set: (v:string|null)=>void}> = {
+      lt: { vals: ['BO','BD'], cur: bFilterLT, set: setBFilterLT },
+      st: { vals: ['UP','DN'], cur: bFilterST, set: setBFilterST },
+      mr: { vals: ['BTFD','STFR'], cur: bFilterMR, set: setBFilterMR },
+    }
+
+    const renderDropdown = (col: string) => {
+      const c = filterCfg[col]
+      if (!c) return null
+      const handleCheck = (val: string) => {
+        const other = val === c.vals[0] ? c.vals[1] : c.vals[0]
+        c.set(c.cur === null ? other : null)
+      }
+      return (
+        <>
+          <div className="col-filter-backdrop" onClick={(e) => { e.stopPropagation(); setBFilterOpen(null) }}></div>
+          <div className="col-filter-dropdown" onClick={(e) => e.stopPropagation()}>
+            <button className="cfd-btn" onClick={() => { handleClick(col as BasketSortCol); setBFilterOpen(null) }}>
+              Sort {bSortCol === col && bSortDir === 1 ? 'Z\u2192A' : 'A\u2192Z'}
+            </button>
+            <div className="cfd-sep"></div>
+            {c.vals.map((v, i) => (
+              <label key={v} className="cfd-check">
+                <input type="checkbox" checked={c.cur === null || c.cur === v} onChange={() => handleCheck(v)} />
+                <span className={i === 0 ? 'sig-bull' : 'sig-bear'}>{v}</span>
+              </label>
+            ))}
+            {c.cur && (
+              <>
+                <div className="cfd-sep"></div>
+                <button className="cfd-btn" onClick={() => { c.set(null); setBFilterOpen(null) }}>Clear Filter</button>
+              </>
+            )}
+          </div>
+        </>
+      )
+    }
+
+    return (
+      <div className="basket-col-header">
+        <span className={`basket-name-text col-hdr ${bSortCol === 'name' ? 'active' : ''}`} onClick={() => handleClick('name')}>
+          Basket{arrow('name')}
+        </span>
+        <span className={`col-bkt col-hdr ${bSortCol === 'bo' ? 'active' : ''}`} onClick={() => handleClick('bo')}>
+          BO%{arrow('bo')}
+        </span>
+        <span className={`col-bkt col-hdr ${bSortCol === 'br' ? 'active' : ''}`} onClick={() => handleClick('br')}>
+          Br%{arrow('br')}
+        </span>
+        <span className={`col-bkt col-hdr ${bSortCol === 'cor' ? 'active' : ''}`} onClick={() => handleClick('cor')}>
+          Cor%{arrow('cor')}
+        </span>
+        <span className={`col-lt col-hdr ${bSortCol === 'lt' ? 'active' : ''} ${bFilterLT ? 'filtered' : ''}`}
+              onClick={() => handleClick('lt')} style={{position:'relative'}}>
+          LT{arrow('lt')}{bFilterOpen === 'lt' && renderDropdown('lt')}
+        </span>
+        <span className={`col-st col-hdr ${bSortCol === 'st' ? 'active' : ''} ${bFilterST ? 'filtered' : ''}`}
+              onClick={() => handleClick('st')} style={{position:'relative'}}>
+          ST{arrow('st')}{bFilterOpen === 'st' && renderDropdown('st')}
+        </span>
+        <span className={`col-mr col-hdr ${bSortCol === 'mr' ? 'active' : ''} ${bFilterMR ? 'filtered' : ''}`}
+              onClick={() => handleClick('mr')} style={{position:'relative'}}>
+          MR{arrow('mr')}{bFilterOpen === 'mr' && renderDropdown('mr')}
+        </span>
+        <span className={`col-pct col-hdr ${bSortCol === 'chg' ? 'active' : ''}`} onClick={() => handleClick('chg')}>
+          Chg{arrow('chg')}
+        </span>
+        {hasFilter && <span className="col-clear-x" onClick={(e) => { e.stopPropagation(); setBFilterLT(null); setBFilterST(null); setBFilterMR(null) }}>{'\u00D7'}</span>}
+      </div>
+    )
+  }
+
   const fmtDV = (dv: number) => {
     if (dv >= 1e9) return `${(dv / 1e9).toFixed(1)}B`
     if (dv >= 1e6) return `${(dv / 1e6).toFixed(0)}M`
@@ -662,7 +791,8 @@ function App() {
                   <span className={`accordion-chevron ${expandedViews.has(view) ? 'expanded' : ''}`}>{'>'}</span>
                   {view}
                 </button>
-                {expandedViews.has(view) && baskets[view].map(item => (
+                {expandedViews.has(view) && renderBasketColHeader()}
+                {expandedViews.has(view) && sortBaskets(baskets[view]).map(item => (
                   <div key={item}>
                     <div
                       className={`accordion-basket-header ${selectedItem === item && viewType === view && !activeTicker ? 'active' : ''}`}
@@ -672,11 +802,26 @@ function App() {
                       <span className="basket-name-text">{item.replace(/_/g, ' ')}</span>
                       {basketBreadth[item] && (
                         <>
-                          <span className={`col-breadth ${(basketBreadth[item].breakout_pct ?? 0) >= 50 ? 'sig-bull' : 'sig-bear'}`}>
+                          <span className={`col-bkt ${(basketBreadth[item].breakout_pct ?? 0) >= 50 ? 'sig-bull' : 'sig-bear'}`}>
                             {basketBreadth[item].breakout_pct != null ? `${basketBreadth[item].breakout_pct}%` : ''}
                           </span>
-                          <span className={`col-breadth ${(basketBreadth[item].uptrend_pct ?? 0) >= 50 ? 'sig-bull' : 'sig-bear'}`}>
+                          <span className={`col-bkt ${(basketBreadth[item].uptrend_pct ?? 0) >= 50 ? 'sig-bull' : 'sig-bear'}`}>
                             {basketBreadth[item].uptrend_pct != null ? `${basketBreadth[item].uptrend_pct}%` : ''}
+                          </span>
+                          <span className="col-bkt sig-corr">
+                            {basketBreadth[item].corr_pct != null ? `${basketBreadth[item].corr_pct}%` : ''}
+                          </span>
+                          <span className={`col-lt ${basketBreadth[item].lt_trend === 'BO' ? 'sig-bull' : 'sig-bear'}`}>
+                            {basketBreadth[item].lt_trend || ''}
+                          </span>
+                          <span className={`col-st ${basketBreadth[item].st_trend === 'UP' ? 'sig-bull' : 'sig-bear'}`}>
+                            {basketBreadth[item].st_trend || ''}
+                          </span>
+                          <span className={`col-mr ${basketBreadth[item].mean_rev ? (basketBreadth[item].mean_rev === 'BTFD' ? 'sig-bull' : 'sig-bear') : ''}`}>
+                            {basketBreadth[item].mean_rev || ''}
+                          </span>
+                          <span className={`col-pct ${(basketBreadth[item].pct_change ?? 0) >= 0 ? 'sig-bull' : 'sig-bear'}`}>
+                            {basketBreadth[item].pct_change != null ? `${basketBreadth[item].pct_change >= 0 ? '+' : ''}${basketBreadth[item].pct_change.toFixed(1)}%` : ''}
                           </span>
                         </>
                       )}
