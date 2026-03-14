@@ -2,6 +2,7 @@ import { useEffect, useState, useRef, useMemo, Component, ReactNode } from 'reac
 import axios from 'axios'
 import { TVChart } from './components/TVChart'
 import { BasketSummary } from './components/BasketSummary'
+import { BacktestPanel } from './components/BacktestPanel'
 
 // DYNAMIC API BASE:
 // Automatically uses the hostname of the machine you are browsing from.
@@ -136,6 +137,8 @@ function App() {
   const [showSummary, setShowSummary] = useState(false)
   const [summaryData, setSummaryData] = useState<BasketSummaryData | null>(null)
   const [summaryLoading, setSummaryLoading] = useState(false)
+  const [showBacktest, setShowBacktest] = useState(false)
+  const [backtestBaskets, setBacktestBaskets] = useState<string[]>([])
   const contentStackRef = useRef<HTMLDivElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const [searchQuery, setSearchQuery] = useState('')
@@ -298,6 +301,7 @@ function App() {
       setActiveTicker(null)
       setShowSummary(false)
       setSummaryData(null)
+      setShowBacktest(false)
       setExpandedBasket(null)
       setExpandedViews(prev => new Set(prev).add('Tickers'))
     } else {
@@ -306,6 +310,7 @@ function App() {
       setActiveTicker(null)
       setShowSummary(false)
       setSummaryData(null)
+      setShowBacktest(false)
       setExpandedBasket(result.name)
       setExpandedViews(prev => new Set(prev).add(result.category))
     }
@@ -446,6 +451,16 @@ function App() {
     }
   }, [canShowSummary, selectedItem, showSummary, isQuarterMode, quarterStart, quarterEnd])
 
+  // Fetch baskets containing this ticker for backtest regime filter source dropdown
+  useEffect(() => {
+    const backtestTarget = activeTicker || selectedItem
+    const backtestIsTicker = !!(activeTicker || isTicker)
+    if (!showBacktest || !backtestIsTicker || !backtestTarget) return
+    axios.get(`${API_BASE}/ticker-baskets/${encodeURIComponent(backtestTarget)}`)
+      .then(res => setBacktestBaskets(res.data))
+      .catch(() => setBacktestBaskets([]))
+  }, [showBacktest, isTicker, activeTicker, selectedItem])
+
   // Auto-select first live signal ticker once data arrives
   useEffect(() => {
     if (viewType === 'LiveSignals' && liveSignalTickers.length > 0 && !selectedItem) {
@@ -471,6 +486,7 @@ function App() {
       setActiveTicker(null)
       setShowSummary(false)
       setSummaryData(null)
+      setShowBacktest(false)
       setExpandedBasket(item)
     }
   }
@@ -481,6 +497,7 @@ function App() {
     setActiveTicker(null)
     setShowSummary(false)
     setSummaryData(null)
+    setShowBacktest(false)
     setExpandedBasket(null)
   }
 
@@ -946,17 +963,27 @@ function App() {
                 </>
               )}
             </div>
-            <div className="header-actions">
+            <div className={`header-actions ${isBasketView ? 'header-actions-grid' : ''}`}>
               {canShowSummary && (
                 <button
                   className={`control-btn ${showSummary ? 'primary' : ''}`}
-                  onClick={() => setShowSummary(prev => !prev)}
+                  style={{ order: 1 }}
+                  onClick={() => { setShowSummary(prev => !prev); setShowBacktest(false) }}
                 >
                   Basket Analysis
                 </button>
               )}
-              <button className="control-btn" onClick={() => setRangeUpdateTrigger({ reset1Y: true })}>Reset 1Y</button>
-              <button className="control-btn" onClick={() => setExportTrigger(p => p + 1)}>Export Image</button>
+              <button className="control-btn" style={{ order: 2 }} onClick={() => setExportTrigger(p => p + 1)}>Export</button>
+              {selectedItem && (
+                <button
+                  className={`control-btn ${showBacktest ? 'primary' : ''}`}
+                  style={{ order: 3 }}
+                  onClick={() => { setShowBacktest(prev => !prev); setShowSummary(false) }}
+                >
+                  Backtest
+                </button>
+              )}
+              <button className="control-btn" style={{ order: 4 }} onClick={() => setRangeUpdateTrigger({ reset1Y: true })}>Reset 1Y</button>
             </div>
             <div className="header-right-stack">
               {quarterKeys.length > 0 && (
@@ -1008,7 +1035,21 @@ function App() {
             </div>
           </div>
           <div className="content-stack" ref={contentStackRef}>
-            {showSummary ? (
+            {showBacktest ? (
+              <BacktestPanel
+                target={activeTicker || selectedItem}
+                targetType={activeTicker || isTicker ? 'ticker' : 'basket'}
+                apiBase={API_BASE}
+                availableBaskets={backtestBaskets}
+                showPivots={showPivots}
+                showTargets={showTargets}
+                showVolume={showVolume && !isBasketView}
+                showBreadth={showBreadth && isBasketView}
+                showBreakout={showBreakout && isBasketView}
+                showCorrelation={showCorrelation && isBasketView}
+                exportTrigger={exportTrigger}
+              />
+            ) : showSummary ? (
               <BasketSummary data={summaryData} loading={summaryLoading} basketName={selectedItem} apiBase={API_BASE} quarterDateRange={isQuarterMode ? quarterToDateRange(quarterStart, quarterEnd) : null} />
             ) : (
             <div className="chart-container">

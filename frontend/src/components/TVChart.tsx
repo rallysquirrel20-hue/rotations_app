@@ -251,48 +251,26 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
     seriesRefs.current.price = candleS;
 
     if (showPivots) {
-      const rs = pc.addLineSeries({ color: 'transparent', priceLineVisible: false, crosshairMarkerVisible: false });
-      const ss = pc.addLineSeries({ color: 'transparent', priceLineVisible: false, crosshairMarkerVisible: false });
-      const rp: any[] = [], sp: any[] = [], rm: any[] = [], sm: any[] = [];
+      const rs = pc.addLineSeries({ color: 'transparent', priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: false, pointMarkersVisible: true, pointMarkersRadius: 1, lineVisible: false } as any);
+      const ss = pc.addLineSeries({ color: 'transparent', priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: false, pointMarkersVisible: true, pointMarkersRadius: 1, lineVisible: false } as any);
+      const rp: any[] = [], sp: any[] = [];
       sortedData.forEach((d, i) => {
         if (d.Resistance_Pivot != null && !d.Trend) {
-          rp.push({ time: times[i], value: Number(d.Resistance_Pivot) });
-          rm.push({ time: times[i], position: 'inBar', color: COLOR_PINK, shape: 'circle', size: 0.1 });
+          rp.push({ time: times[i], value: Number(d.Resistance_Pivot), color: COLOR_PINK });
         }
         if (d.Support_Pivot != null && d.Trend) {
-          sp.push({ time: times[i], value: Number(d.Support_Pivot) });
-          sm.push({ time: times[i], position: 'inBar', color: COLOR_BLUE, shape: 'circle', size: 0.1 });
+          sp.push({ time: times[i], value: Number(d.Support_Pivot), color: COLOR_BLUE });
         }
       });
-      rs.setData(rp); rs.setMarkers(rm);
-      ss.setData(sp); ss.setMarkers(sm);
-    }
-
-    // BTFD / STFR entry arrows (always-on debug overlay)
-    {
-      const btfdSeries = pc.addLineSeries({ color: 'transparent', priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: false });
-      const stfrSeries = pc.addLineSeries({ color: 'transparent', priceLineVisible: false, crosshairMarkerVisible: false, lastValueVisible: false });
-      const btfdData: any[] = [], btfdMarkers: any[] = [];
-      const stfrData: any[] = [], stfrMarkers: any[] = [];
-      sortedData.forEach((d, i) => {
-        if (d.Is_BTFD === true) {
-          btfdData.push({ time: times[i], value: Number(d.Low) });
-          btfdMarkers.push({ time: times[i], position: 'belowBar', color: 'rgb(0, 180, 0)', shape: 'arrowUp', size: 1.5, text: 'BTFD' });
-        }
-        if (d.Is_STFR === true) {
-          stfrData.push({ time: times[i], value: Number(d.High) });
-          stfrMarkers.push({ time: times[i], position: 'aboveBar', color: COLOR_PINK, shape: 'arrowDown', size: 1.5, text: 'STFR' });
-        }
-      });
-      if (btfdData.length) { btfdSeries.setData(btfdData); btfdSeries.setMarkers(btfdMarkers); }
-      if (stfrData.length) { stfrSeries.setData(stfrData); stfrSeries.setMarkers(stfrMarkers); }
+      rs.setData(rp);
+      ss.setData(sp);
     }
 
     if (showTargets) {
       const uT = sortedData.filter(d => d.Upper_Target != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Upper_Target) }));
       const lT = sortedData.filter(d => d.Lower_Target != null).map(d => ({ time: parseTime(d.Date), value: Number(d.Lower_Target) }));
-      if (uT.length) pc.addLineSeries({ color: COLOR_BLUE, lineWidth: 2, lineType: LineType.WithSteps, priceLineVisible: false, crosshairMarkerVisible: false }).setData(uT);
-      if (lT.length) pc.addLineSeries({ color: COLOR_PINK, lineWidth: 2, lineType: LineType.WithSteps, priceLineVisible: false, crosshairMarkerVisible: false }).setData(lT);
+      if (uT.length) pc.addLineSeries({ color: COLOR_BLUE, lineWidth: 2, priceLineVisible: false, crosshairMarkerVisible: false }).setData(uT);
+      if (lT.length) pc.addLineSeries({ color: COLOR_PINK, lineWidth: 2, priceLineVisible: false, crosshairMarkerVisible: false }).setData(lT);
     }
 
     // Indicator panes — same pattern as volume for all
@@ -498,6 +476,111 @@ export const TVChart: React.FC<TVChartProps> = (props) => {
       setRange({ from, to });
     }
   }, [props.rangeUpdateTrigger]);
+
+  // Track previous exportTrigger so we only fire on actual button clicks, not remounts
+  const prevExportTrigger = useRef(props.exportTrigger || 0);
+  useEffect(() => {
+    if (!props.exportTrigger || props.exportTrigger === prevExportTrigger.current) {
+      prevExportTrigger.current = props.exportTrigger || 0;
+      return;
+    }
+    prevExportTrigger.current = props.exportTrigger;
+
+    const paneOrder: { id: string; visible: boolean }[] = [
+      { id: 'price',       visible: true },
+      { id: 'volume',      visible: !!showVolume },
+      { id: 'breadth',     visible: !!showBreadth },
+      { id: 'breakout',    visible: !!showBreakout },
+      { id: 'correlation', visible: !!showCorrelation },
+    ];
+
+    const RESIZER_HEIGHT = 6;
+    const canvases: { canvas: HTMLCanvasElement; addResizer: boolean }[] = [];
+    let totalWidth = 0;
+    let totalHeight = 0;
+
+    for (const pane of paneOrder) {
+      if (!pane.visible) continue;
+      const chart = charts.current[pane.id];
+      if (!chart) continue;
+      try {
+        const screenshot = chart.takeScreenshot();
+        if (canvases.length > 0) {
+          totalHeight += RESIZER_HEIGHT;
+        }
+        canvases.push({ canvas: screenshot, addResizer: canvases.length > 0 });
+        totalHeight += screenshot.height;
+        totalWidth = Math.max(totalWidth, screenshot.width);
+      } catch {
+        // chart may not be ready
+      }
+    }
+
+    if (canvases.length === 0 || totalWidth === 0) return;
+
+    // Get visible date range from price chart
+    const priceChart = charts.current.price;
+    let fromDate = '';
+    let toDate = '';
+    if (priceChart) {
+      const range = priceChart.timeScale().getVisibleRange();
+      if (range) {
+        const fmt = (t: any) => {
+          const d = new Date(Number(t) * 1000);
+          return d.toISOString().slice(0, 10);
+        };
+        fromDate = fmt(range.from);
+        toDate = fmt(range.to);
+      }
+    }
+
+    const name = props.symbolName || props.basketName || 'chart';
+    const dateLabel = fromDate && toDate ? `${fromDate} to ${toDate}` : '';
+
+    const composite = document.createElement('canvas');
+    composite.width = totalWidth;
+    composite.height = totalHeight;
+    const ctx = composite.getContext('2d');
+    if (!ctx) return;
+
+    // Fill background
+    ctx.fillStyle = SOLAR_BASE3;
+    ctx.fillRect(0, 0, totalWidth, totalHeight);
+
+    let y = 0;
+    for (const { canvas, addResizer } of canvases) {
+      if (addResizer) {
+        ctx.fillStyle = SOLAR_BASE1;
+        ctx.fillRect(0, y, totalWidth, RESIZER_HEIGHT);
+        y += RESIZER_HEIGHT;
+      }
+      ctx.drawImage(canvas, 0, y);
+      y += canvas.height;
+    }
+
+    // Draw name and date range label in upper left
+    const labelText = dateLabel ? `${name}  |  ${dateLabel}` : name;
+    ctx.font = 'bold 14px Consolas, "Fira Code", monospace';
+    const textMetrics = ctx.measureText(labelText);
+    const padding = 8;
+    const boxW = textMetrics.width + padding * 2;
+    const boxH = 22;
+    ctx.fillStyle = 'rgba(253, 246, 227, 0.85)';
+    ctx.fillRect(8, 8, boxW, boxH);
+    ctx.fillStyle = SOLAR_BASE01;
+    ctx.fillText(labelText, 8 + padding, 8 + 16);
+
+    const fileDatePart = fromDate && toDate ? `_${fromDate}_${toDate}` : '';
+    composite.toBlob((blob) => {
+      if (!blob) return;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${name}${fileDatePart}.png`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }, 'image/png');
+  }, [props.exportTrigger]);
 
   // Ordered indicator pane definitions
   const allPanes: { id: PaneId; ref: React.RefObject<HTMLDivElement>; visible: boolean }[] = [
